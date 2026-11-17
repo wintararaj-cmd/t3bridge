@@ -1,8 +1,17 @@
 // Tauri v2 IPC Bridge
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : async (cmd, args) => {
   console.log(`[Mock Invoke] ${cmd}`, args);
-  if (cmd === 'get_hardware_id') return "T3-A1B2-C3D4";
-  if (cmd === 'get_session_status') return { is_connected: false, drive_letter: null, mapped_unc: null, latency_ms: 0, status_text: "Disconnected" };
+  if (cmd === 'get_hardware_id') return "T3-D03F-944C-857E";
+  if (cmd === 'get_session_status') return {
+    is_connected: false,
+    drive_letter: null,
+    mapped_unc: null,
+    latency_ms: 0,
+    status_text: "Disconnected",
+    health_level: "Optimal",
+    is_safe: true,
+    alert_message: null
+  };
   if (cmd === 'connect_bridge') return "Connected successfully!";
   if (cmd === 'disconnect_bridge') return true;
   return null;
@@ -24,8 +33,12 @@ const driveLetter = document.getElementById('driveLetter');
 const headerStatusBadge = document.getElementById('headerStatusBadge');
 const statusText = document.getElementById('statusText');
 const metricLatency = document.getElementById('metricLatency');
+const metricHealth = document.getElementById('metricHealth');
 const metricIp = document.getElementById('metricIp');
 const metricPath = document.getElementById('metricPath');
+const watchdogBanner = document.getElementById('watchdogBanner');
+const watchdogIcon = document.getElementById('watchdogIcon');
+const watchdogText = document.getElementById('watchdogText');
 const btnActivateLicense = document.getElementById('btnActivateLicense');
 const licenseInput = document.getElementById('licenseInput');
 const licenseAlert = document.getElementById('licenseAlert');
@@ -72,7 +85,8 @@ btnConnect.addEventListener('click', async () => {
     });
 
     isConnected = true;
-    updateUiStatus(true, driveLetter.value);
+    const status = await invoke('get_session_status');
+    updateUiStatus(status);
   } catch (err) {
     alert(`Connection Error: ${err}`);
   } finally {
@@ -86,7 +100,8 @@ btnDisconnect.addEventListener('click', async () => {
   try {
     await invoke('disconnect_bridge');
     isConnected = false;
-    updateUiStatus(false);
+    const status = await invoke('get_session_status');
+    updateUiStatus(status);
   } catch (err) {
     alert(`Disconnect Error: ${err}`);
   }
@@ -111,24 +126,49 @@ btnActivateLicense.addEventListener('click', async () => {
   }
 });
 
-function updateUiStatus(connected, letter = null) {
+function updateUiStatus(status) {
+  const connected = status.is_connected;
   const dot = headerStatusBadge.querySelector('.status-dot');
+  metricHealth.className = "metric-value";
+
   if (connected) {
     dot.className = "status-dot connected";
-    statusText.textContent = `Bridged (${letter || 'Z'}:)`;
+    statusText.textContent = `Bridged (${status.drive_letter || 'Z'}:)`;
     btnConnect.style.display = "none";
     btnDisconnect.style.display = "inline-block";
-    metricLatency.textContent = "18 ms";
+    metricLatency.textContent = `${status.latency_ms} ms`;
     metricIp.textContent = "10.99.0.1";
-    metricPath.textContent = `${letter || 'Z'}: -> SharedData`;
+    metricPath.textContent = `${status.drive_letter || 'Z'}: -> SharedData`;
+
+    metricHealth.textContent = status.health_level || "Optimal";
+    if (status.health_level === "Optimal") metricHealth.classList.add("health-optimal");
+    else if (status.health_level === "Acceptable") metricHealth.classList.add("health-acceptable");
+    else if (status.health_level === "Degraded") metricHealth.classList.add("health-degraded");
+    else metricHealth.classList.add("health-unstable");
+
+    if (status.alert_message) {
+      watchdogBanner.style.display = "flex";
+      watchdogText.textContent = status.alert_message;
+      if (status.is_safe) {
+        watchdogBanner.className = "watchdog-banner warning";
+        watchdogIcon.textContent = "ℹ️";
+      } else {
+        watchdogBanner.className = "watchdog-banner critical";
+        watchdogIcon.textContent = "⚠️";
+      }
+    } else {
+      watchdogBanner.style.display = "none";
+    }
   } else {
     dot.className = "status-dot disconnected";
     statusText.textContent = "Disconnected";
     btnConnect.style.display = "inline-block";
     btnDisconnect.style.display = "none";
     metricLatency.textContent = "-- ms";
+    metricHealth.textContent = "--";
     metricIp.textContent = "--";
     metricPath.textContent = "None";
+    watchdogBanner.style.display = "none";
   }
 }
 
@@ -136,17 +176,12 @@ function updateUiStatus(connected, letter = null) {
 setInterval(async () => {
   try {
     const status = await invoke('get_session_status');
-    if (status.is_connected !== isConnected) {
-      isConnected = status.is_connected;
-      updateUiStatus(isConnected, status.drive_letter);
-    }
-    if (isConnected && status.latency_ms > 0) {
-      metricLatency.textContent = `${status.latency_ms} ms`;
-    }
+    isConnected = status.is_connected;
+    updateUiStatus(status);
   } catch (err) {
     // Ignore offline poll errors
   }
-}, 3000);
+}, 2500);
 
 // Initialize on page load
 loadHwid();

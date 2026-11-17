@@ -4,4 +4,4 @@ pub mod peer;
 
 pub use app_profile::AppProfile;
 pub use license::{License, LicensePayload, LicenseTier};
-pub use peer::{Peer, PeerRole, TunnelMetrics};
+pub use peer::{ConnectionHealth, Peer, PeerRole, TunnelMetrics};

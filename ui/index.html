@@ -74,6 +74,10 @@
             <span class="metric-value" id="metricLatency">-- ms</span>
           </div>
           <div class="metric-card">
+            <span class="metric-label">Health & Safety</span>
+            <span class="metric-value" id="metricHealth">--</span>
+          </div>
+          <div class="metric-card">
             <span class="metric-label">Virtual IP</span>
             <span class="metric-value" id="metricIp">--</span>
           </div>
@@ -81,6 +85,12 @@
             <span class="metric-label">Mapped Path</span>
             <span class="metric-value" id="metricPath">None</span>
           </div>
+        </div>
+
+        <!-- Watchdog Stability Banner -->
+        <div id="watchdogBanner" class="watchdog-banner" style="display: none;">
+          <span id="watchdogIcon">⚠️</span>
+          <span id="watchdogText">Connection is stable</span>
         </div>
       </section>
 

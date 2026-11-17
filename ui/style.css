@@ -243,17 +243,57 @@ body {
 /* Metrics Grid */
 .metrics-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
 }
 
 .metric-card {
   background-color: var(--card-bg);
   border: 1px solid var(--border-color);
   border-radius: 10px;
-  padding: 14px 16px;
+  padding: 12px 14px;
   display: flex;
   flex-direction: column;
+}
+
+.health-optimal {
+  color: #10b981 !important;
+}
+
+.health-acceptable {
+  color: #38bdf8 !important;
+}
+
+.health-degraded {
+  color: #f59e0b !important;
+}
+
+.health-unstable {
+  color: #ef4444 !important;
+}
+
+.watchdog-banner {
+  padding: 12px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid transparent;
+  margin-top: 14px;
+}
+
+.watchdog-banner.warning {
+  background: rgba(245, 158, 11, 0.15);
+  border-color: rgba(245, 158, 11, 0.4);
+  color: #fbbf24;
+}
+
+.watchdog-banner.critical {
+  background: rgba(239, 68, 68, 0.15);
+  border-color: rgba(239, 68, 68, 0.4);
+  color: #f87171;
 }
 
 .metric-label {

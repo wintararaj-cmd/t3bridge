@@ -15,6 +15,33 @@ pub struct TunnelMetrics {
     pub packet_loss_percent: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionHealth {
+    Optimal,     // < 50ms, 0% loss
+    Acceptable,  // 50ms - 120ms, <= 2% loss
+    Degraded,    // 120ms - 250ms, or packet loss 2% - 10%
+    Unstable,    // > 250ms or > 10% loss - high risk for DBF/CDX index corruption
+    Dead,        // Complete disconnection
+}
+
+impl ConnectionHealth {
+    pub fn evaluate(metrics: &TunnelMetrics) -> Self {
+        if metrics.packet_loss_percent > 10 || metrics.latency_ms > 250 {
+            ConnectionHealth::Unstable
+        } else if metrics.packet_loss_percent > 2 || metrics.latency_ms > 120 {
+            ConnectionHealth::Degraded
+        } else if metrics.latency_ms > 50 {
+            ConnectionHealth::Acceptable
+        } else {
+            ConnectionHealth::Optimal
+        }
+    }
+
+    pub fn is_safe_for_file_erp(&self) -> bool {
+        matches!(self, ConnectionHealth::Optimal | ConnectionHealth::Acceptable)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
     pub peer_id: String,
@@ -35,5 +62,40 @@ impl Peer {
             public_endpoint: None,
             is_online: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_connection_health_evaluation() {
+        let optimal = TunnelMetrics {
+            latency_ms: 25,
+            bytes_sent: 100,
+            bytes_received: 200,
+            packet_loss_percent: 0,
+        };
+        assert_eq!(ConnectionHealth::evaluate(&optimal), ConnectionHealth::Optimal);
+        assert!(ConnectionHealth::evaluate(&optimal).is_safe_for_file_erp());
+
+        let degraded = TunnelMetrics {
+            latency_ms: 150,
+            bytes_sent: 100,
+            bytes_received: 200,
+            packet_loss_percent: 1,
+        };
+        assert_eq!(ConnectionHealth::evaluate(&degraded), ConnectionHealth::Degraded);
+        assert!(!ConnectionHealth::evaluate(&degraded).is_safe_for_file_erp());
+
+        let unstable = TunnelMetrics {
+            latency_ms: 300,
+            bytes_sent: 100,
+            bytes_received: 200,
+            packet_loss_percent: 15,
+        };
+        assert_eq!(ConnectionHealth::evaluate(&unstable), ConnectionHealth::Unstable);
+        assert!(!ConnectionHealth::evaluate(&unstable).is_safe_for_file_erp());
     }
 }

@@ -39,5 +39,7 @@ $RECYCLE.BIN/
 *.pem
 private_key.bin
 license_secret.env
+license_*.json
+*.log
 .env
 .env.local
