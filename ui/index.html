@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>t3Bridge — P2P Business Application Bridge</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="logo-group">
+        <div class="logo-icon">t3</div>
+        <div class="logo-text">
+          <h1>t3Bridge</h1>
+          <span>Universal P2P Mesh Network</span>
+        </div>
+      </div>
+      <div class="status-badge" id="headerStatusBadge">
+        <span class="status-dot disconnected"></span>
+        <span id="statusText">Disconnected</span>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="nav-tabs">
+      <button class="tab-btn active" data-tab="tab-connect">Connection</button>
+      <button class="tab-btn" data-tab="tab-license">License & HWID</button>
+      <button class="tab-btn" data-tab="tab-host">Host / Office Server</button>
+    </nav>
+
+    <!-- Main Content Area -->
+    <main class="tab-content">
+      <!-- Tab 1: Connect -->
+      <section id="tab-connect" class="tab-pane active">
+        <div class="card">
+          <div class="form-group">
+            <label for="appProfileSelect">Target Business Application</label>
+            <select id="appProfileSelect" class="input-control">
+              <option value="marg_erp">Marg ERP 9+ (Accounting & Inventory)</option>
+              <option value="tally_prime">Tally Prime / ERP 9</option>
+              <option value="busy_erp">Busy Accounting</option>
+              <option value="custom">Custom Network SMB Share</option>
+            </select>
+          </div>
+
+          <div class="grid-2">
+            <div class="form-group">
+              <label for="targetPeerId">Office Server / Connect Code</label>
+              <input type="text" id="targetPeerId" class="input-control" placeholder="e.g. OFFICE-HQ-01" value="OFFICE-HQ-01" />
+            </div>
+            <div class="form-group">
+              <label for="driveLetter">Map Drive Letter</label>
+              <select id="driveLetter" class="input-control">
+                <option value="Z">Z: (Recommended)</option>
+                <option value="Y">Y:</option>
+                <option value="X">X:</option>
+                <option value="W">W:</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="action-row">
+            <button id="btnConnect" class="btn btn-primary">Connect Bridge</button>
+            <button id="btnDisconnect" class="btn btn-danger" style="display: none;">Disconnect</button>
+          </div>
+        </div>
+
+        <!-- Live Metrics Card -->
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <span class="metric-label">Latency</span>
+            <span class="metric-value" id="metricLatency">-- ms</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Virtual IP</span>
+            <span class="metric-value" id="metricIp">--</span>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Mapped Path</span>
+            <span class="metric-value" id="metricPath">None</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tab 2: License -->
+      <section id="tab-license" class="tab-pane">
+        <div class="card">
+          <h3>Machine Fingerprint</h3>
+          <p class="description">Send this Hardware ID to your software provider to generate a commercial license.</p>
+          <div class="hwid-container">
+            <code id="displayHwid">Detecting...</code>
+            <button id="btnCopyHwid" class="btn btn-secondary">Copy HWID</button>
+          </div>
+
+          <hr class="divider" />
+
+          <h3>Activate License Key</h3>
+          <p class="description">Paste your signed JSON license key below:</p>
+          <textarea id="licenseInput" class="input-control textarea" placeholder='{"payload": {...}, "signature_base64": "..."}' rows="4"></textarea>
+          <button id="btnActivateLicense" class="btn btn-primary" style="margin-top: 10px;">Activate License</button>
+
+          <div id="licenseAlert" class="alert-box" style="display: none;"></div>
+        </div>
+      </section>
+
+      <!-- Tab 3: Host Mode -->
+      <section id="tab-host" class="tab-pane">
+        <div class="card">
+          <h3>Host / Office Server Mode</h3>
+          <p class="description">Enable this on the main computer where your ERP and Database files are physically stored.</p>
+          
+          <div class="toggle-row">
+            <div>
+              <strong>Accept Inbound Branch Connections</strong>
+              <div class="sub-text">Allows remote laptops and branches to bridge with this machine.</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="toggleHostMode" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="share-info-box">
+            <div class="info-item">
+              <span class="info-label">Your Connect Code:</span>
+              <strong class="info-code" id="hostConnectCode">OFFICE-HQ-01</strong>
+            </div>
+            <div class="info-item">
+              <span class="info-label">Active Virtual Subnet:</span>
+              <span>10.99.0.1/24</span>
+            </div>
+            <div class="info-item">
+              <span class="info-label">Status:</span>
+              <span class="badge-success">Broadcasting on P2P Mesh</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>

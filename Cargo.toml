@@ -5,6 +5,7 @@ members = [
     "crates/marg_application",
     "crates/marg_adapters",
     "crates/marg_licensing_tool",
+    "src-tauri",
 ]
 
 [workspace.package]
