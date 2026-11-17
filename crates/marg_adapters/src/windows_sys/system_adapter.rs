@@ -1,0 +1,92 @@
+use async_trait::async_trait;
+use marg_application::ports::WindowsSystemPort;
+use marg_domain::{DomainError, DomainResult};
+use std::path::Path;
+use std::process::Command;
+
+pub struct WindowsSystemAdapter;
+
+impl WindowsSystemAdapter {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for WindowsSystemAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl WindowsSystemPort for WindowsSystemAdapter {
+    async fn mount_drive(&self, letter: char, unc_path: &str) -> DomainResult<()> {
+        let drive_spec = format!("{}:", letter.to_ascii_uppercase());
+
+        // Run: net use Z: \\10.99.0.1\Share /persistent:no
+        let output = Command::new("net")
+            .args(["use", &drive_spec, unc_path, "/persistent:no"])
+            .output()
+            .map_err(|e| DomainError::InvalidIpAddress(format!("Failed to spawn 'net use': {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(DomainError::InvalidIpAddress(format!(
+                "Failed to mount drive {}: {} {}",
+                drive_spec, stdout, stderr
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn unmount_drive(&self, letter: char) -> DomainResult<()> {
+        let drive_spec = format!("{}:", letter.to_ascii_uppercase());
+
+        // Run: net use Z: /delete /y
+        let _ = Command::new("net")
+            .args(["use", &drive_spec, "/delete", "/y"])
+            .output();
+
+        Ok(())
+    }
+
+    async fn is_drive_in_use(&self, letter: char) -> DomainResult<bool> {
+        let path_str = format!(r"{}:\", letter.to_ascii_uppercase());
+        let exists = Path::new(&path_str).exists();
+        Ok(exists)
+    }
+
+    async fn configure_firewall_rule(&self, subnet_cidr: &str) -> DomainResult<()> {
+        // Run: netsh advfirewall firewall add rule name="t3Bridge-SMB" dir=in action=allow protocol=TCP localport=445 remoteip=10.99.0.0/24
+        let _ = Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                "name=t3Bridge-SMB",
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                "localport=445",
+                &format!("remoteip={}", subnet_cidr),
+            ])
+            .output();
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_c_drive_is_in_use() {
+        let adapter = WindowsSystemAdapter::new();
+        // C: drive is always in use on Windows
+        assert!(adapter.is_drive_in_use('C').await.unwrap());
+    }
+}
