@@ -36,13 +36,39 @@
       <section id="tab-connect" class="tab-pane active">
         <div class="card">
           <div class="form-group">
-            <label for="appProfileSelect">Target Business Application</label>
-            <select id="appProfileSelect" class="input-control">
-              <option value="marg_erp">Marg ERP 9+ (Accounting & Inventory)</option>
-              <option value="tally_prime">Tally Prime / ERP 9</option>
-              <option value="busy_erp">Busy Accounting</option>
-              <option value="custom">Custom Network SMB Share</option>
-            </select>
+            <div class="label-with-action">
+              <label for="appProfileSelect">Target Business Application / Share</label>
+              <button type="button" id="btnToggleNewProfile" class="btn-text-link">+ Add Custom Application</button>
+            </div>
+            <div class="select-with-delete">
+              <select id="appProfileSelect" class="input-control">
+                <option value="primary_erp">Primary Business ERP (Database & Share)</option>
+                <option value="branch_share">Branch Accounting & Document Share</option>
+                <option value="smb_share">General SMB Network Share</option>
+              </select>
+              <button type="button" id="btnDeleteProfile" class="btn-icon-danger" title="Remove custom profile" style="display: none;">🗑️</button>
+            </div>
+          </div>
+
+          <!-- Inline Custom Profile Creator -->
+          <div id="newProfileContainer" class="new-profile-box" style="display: none;">
+            <div class="new-profile-header">
+              <span>Add Custom Business Application</span>
+              <button type="button" id="btnCloseProfileBox" class="btn-close">&times;</button>
+            </div>
+            <div class="grid-2">
+              <div class="form-group">
+                <label for="newProfileName">Application Name</label>
+                <input type="text" id="newProfileName" class="input-control" placeholder="e.g. My Accounting ERP, Godown Share" />
+              </div>
+              <div class="form-group">
+                <label for="newProfileShare">Server Share Folder</label>
+                <input type="text" id="newProfileShare" class="input-control" placeholder="e.g. SharedData" value="SharedData" />
+              </div>
+            </div>
+            <div class="action-row" style="margin-top: 6px;">
+              <button type="button" id="btnSaveCustomProfile" class="btn btn-secondary btn-sm">Save & Select</button>
+            </div>
           </div>
 
           <div class="grid-2">

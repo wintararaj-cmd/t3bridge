@@ -98,10 +98,9 @@ pub async fn activate_license(
 #[tauri::command]
 pub fn get_app_profiles() -> Vec<AppProfile> {
     vec![
-        AppProfile::marg_erp(),
-        AppProfile::tally_prime(),
-        AppProfile::busy_erp(),
-        AppProfile::custom("Custom Business ERP", "Data", 'W'),
+        AppProfile::primary_erp(),
+        AppProfile::branch_share(),
+        AppProfile::custom("General SMB Network Share", "Share", 'W'),
     ]
 }
 
@@ -109,6 +108,8 @@ pub fn get_app_profiles() -> Vec<AppProfile> {
 pub async fn connect_bridge(
     target_peer_id: String,
     app_id: String,
+    custom_name: Option<String>,
+    custom_share: Option<String>,
     drive_letter: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
@@ -118,11 +119,15 @@ pub async fn connect_bridge(
         .unwrap_or('Z')
         .to_ascii_uppercase();
 
-    let profiles = get_app_profiles();
-    let selected_app = profiles
-        .into_iter()
-        .find(|p| p.id == app_id)
-        .unwrap_or_else(AppProfile::marg_erp);
+    let selected_app = if let (Some(name), Some(share)) = (custom_name, custom_share) {
+        AppProfile::custom(&name, &share, letter)
+    } else {
+        let profiles = get_app_profiles();
+        profiles
+            .into_iter()
+            .find(|p| p.id == app_id)
+            .unwrap_or_else(AppProfile::primary_erp)
+    };
 
     let virtual_ip = VirtualIp::new("10.99.0.1", 24).map_err(|e| e.to_string())?;
     let dummy_peer = Peer::new(

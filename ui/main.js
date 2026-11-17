@@ -43,6 +43,108 @@ const btnActivateLicense = document.getElementById('btnActivateLicense');
 const licenseInput = document.getElementById('licenseInput');
 const licenseAlert = document.getElementById('licenseAlert');
 
+// Custom Profile Elements
+const btnToggleNewProfile = document.getElementById('btnToggleNewProfile');
+const newProfileContainer = document.getElementById('newProfileContainer');
+const btnCloseProfileBox = document.getElementById('btnCloseProfileBox');
+const newProfileName = document.getElementById('newProfileName');
+const newProfileShare = document.getElementById('newProfileShare');
+const btnSaveCustomProfile = document.getElementById('btnSaveCustomProfile');
+const btnDeleteProfile = document.getElementById('btnDeleteProfile');
+
+// Default Profiles
+const defaultProfiles = [
+  { id: "primary_erp", name: "Primary Business ERP (Database & Share)", share: "SharedData" },
+  { id: "branch_share", name: "Branch Accounting & Document Share", share: "BranchData" },
+  { id: "smb_share", name: "General SMB Network Share", share: "Share" },
+];
+
+function getCustomProfiles() {
+  try {
+    return JSON.parse(localStorage.getItem('t3_custom_profiles')) || [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCustomProfiles(profiles) {
+  localStorage.setItem('t3_custom_profiles', JSON.stringify(profiles));
+}
+
+function renderProfiles(selectedId = null) {
+  const customs = getCustomProfiles();
+  const allProfiles = [...defaultProfiles, ...customs];
+
+  appProfileSelect.innerHTML = '';
+  allProfiles.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = p.isCustom ? `${p.name} (Custom)` : p.name;
+    opt.dataset.isCustom = p.isCustom ? "true" : "false";
+    opt.dataset.share = p.share || "SharedData";
+    opt.dataset.name = p.name;
+    appProfileSelect.appendChild(opt);
+  });
+
+  if (selectedId && allProfiles.some(p => p.id === selectedId)) {
+    appProfileSelect.value = selectedId;
+  }
+
+  updateProfileButtons();
+}
+
+function updateProfileButtons() {
+  const selectedOpt = appProfileSelect.options[appProfileSelect.selectedIndex];
+  if (selectedOpt && selectedOpt.dataset.isCustom === "true") {
+    btnDeleteProfile.style.display = "inline-block";
+  } else {
+    btnDeleteProfile.style.display = "none";
+  }
+}
+
+appProfileSelect.addEventListener('change', updateProfileButtons);
+
+btnToggleNewProfile.addEventListener('click', () => {
+  newProfileContainer.style.display = newProfileContainer.style.display === "none" ? "block" : "none";
+  if (newProfileContainer.style.display === "block") {
+    newProfileName.focus();
+  }
+});
+
+btnCloseProfileBox.addEventListener('click', () => {
+  newProfileContainer.style.display = "none";
+});
+
+btnSaveCustomProfile.addEventListener('click', () => {
+  const name = newProfileName.value.trim();
+  const share = newProfileShare.value.trim() || "SharedData";
+
+  if (!name) {
+    alert("Please enter an Application Name (e.g. 'My Godown Inventory')");
+    return;
+  }
+
+  const customs = getCustomProfiles();
+  const id = `custom_${Date.now()}`;
+  customs.push({ id, name, share, isCustom: true });
+  saveCustomProfiles(customs);
+
+  newProfileName.value = '';
+  newProfileShare.value = 'SharedData';
+  newProfileContainer.style.display = "none";
+
+  renderProfiles(id);
+});
+
+btnDeleteProfile.addEventListener('click', () => {
+  const selectedId = appProfileSelect.value;
+  if (!confirm("Are you sure you want to remove this custom profile?")) return;
+
+  const customs = getCustomProfiles().filter(p => p.id !== selectedId);
+  saveCustomProfiles(customs);
+  renderProfiles("primary_erp");
+});
+
 // 1. Tab Switching
 tabBtns.forEach(btn => {
   btn.addEventListener('click', () => {
@@ -78,9 +180,16 @@ btnConnect.addEventListener('click', async () => {
   btnConnect.textContent = "Connecting...";
 
   try {
+    const selectedOpt = appProfileSelect.options[appProfileSelect.selectedIndex];
+    const isCustom = selectedOpt && selectedOpt.dataset.isCustom === "true";
+    const customName = isCustom ? selectedOpt.dataset.name : null;
+    const customShare = isCustom ? selectedOpt.dataset.share : null;
+
     const res = await invoke('connect_bridge', {
       targetPeerId: targetPeerId.value.trim(),
       appId: appProfileSelect.value,
+      customName: customName,
+      customShare: customShare,
       driveLetter: driveLetter.value
     });
 
@@ -184,4 +293,5 @@ setInterval(async () => {
 }, 2500);
 
 // Initialize on page load
+renderProfiles();
 loadHwid();

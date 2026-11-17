@@ -10,34 +10,36 @@ pub struct AppProfile {
 }
 
 impl AppProfile {
-    pub fn marg_erp() -> Self {
+    pub fn primary_erp() -> Self {
         Self {
-            id: "marg_erp".into(),
-            name: "Marg ERP 9+".into(),
-            default_share_name: "MargERP".into(),
+            id: "primary_erp".into(),
+            name: "Primary Business ERP (Database & Share)".into(),
+            default_share_name: "SharedData".into(),
             suggested_drive_letter: 'Z',
-            executable_name: Some("marg2014.exe".into()),
+            executable_name: None,
         }
+    }
+
+    pub fn branch_share() -> Self {
+        Self {
+            id: "branch_share".into(),
+            name: "Branch Accounting & Document Share".into(),
+            default_share_name: "BranchData".into(),
+            suggested_drive_letter: 'Y',
+            executable_name: None,
+        }
+    }
+
+    pub fn marg_erp() -> Self {
+        Self::primary_erp()
     }
 
     pub fn tally_prime() -> Self {
-        Self {
-            id: "tally_prime".into(),
-            name: "Tally Prime".into(),
-            default_share_name: "TallyData".into(),
-            suggested_drive_letter: 'Y',
-            executable_name: Some("tally.exe".into()),
-        }
+        Self::branch_share()
     }
 
     pub fn busy_erp() -> Self {
-        Self {
-            id: "busy_erp".into(),
-            name: "Busy Accounting".into(),
-            default_share_name: "BusyData".into(),
-            suggested_drive_letter: 'X',
-            executable_name: Some("busy.exe".into()),
-        }
+        Self::custom("Secondary Business Share", "AccountingData", 'X')
     }
 
     pub fn custom(name: &str, share_name: &str, drive_letter: char) -> Self {

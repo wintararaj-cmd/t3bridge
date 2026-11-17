@@ -115,7 +115,7 @@ mod tests {
             .expect_mount_drive()
             .with(
                 mockall::predicate::eq('Z'),
-                mockall::predicate::eq(r"\\10.99.0.1\MargERP"),
+                mockall::predicate::eq(r"\\10.99.0.1\SharedData"),
             )
             .times(1)
             .returning(|_, _| Ok(()));
@@ -123,13 +123,13 @@ mod tests {
         let usecase = ConnectToHostUseCase::new(Arc::new(mock_tunnel), Arc::new(mock_system));
 
         let peer = dummy_peer();
-        let app = AppProfile::marg_erp();
+        let app = AppProfile::primary_erp();
         let res = usecase.execute(&peer, &app, 'Z', "LIC-123").await;
 
         assert!(res.is_ok());
         let session = res.unwrap();
         assert_eq!(session.drive_letter, 'Z');
-        assert_eq!(session.session_unc_path, r"\\10.99.0.1\MargERP");
+        assert_eq!(session.session_unc_path, r"\\10.99.0.1\SharedData");
     }
 
     #[tokio::test]
