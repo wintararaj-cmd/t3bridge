@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use marg_application::ports::LicenseStoragePort;
-use marg_domain::{DomainError, DomainResult, License};
+use t3_application::ports::LicenseStoragePort;
+use t3_domain::{DomainError, DomainResult, License};
 use std::path::PathBuf;
 
 pub struct FileLicenseStorage {

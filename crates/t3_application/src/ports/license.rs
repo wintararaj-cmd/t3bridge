@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use marg_domain::{DomainResult, HardwareId, License};
+use t3_domain::{DomainResult, HardwareId, License};
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]

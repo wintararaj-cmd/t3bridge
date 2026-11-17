@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use marg_domain::{DomainResult, HolePunchPayload, SignalingMessage, VirtualIp};
+use t3_domain::{DomainResult, HolePunchPayload, SignalingMessage, VirtualIp};
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]

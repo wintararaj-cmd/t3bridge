@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use marg_domain::{DomainResult, Peer, TunnelMetrics, VirtualIp};
+use t3_domain::{DomainResult, Peer, TunnelMetrics, VirtualIp};
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]

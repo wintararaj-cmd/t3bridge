@@ -1,18 +1,19 @@
 [package]
-name = "marg_adapters"
+name = "t3_licensing_tool"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "licgen"
+path = "src/main.rs"
+
 [dependencies]
-marg_domain = { path = "../marg_domain" }
-marg_application = { path = "../marg_application" }
+t3_domain = { path = "../t3_domain" }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-async-trait.workspace = true
-tokio.workspace = true
+chrono.workspace = true
 ed25519-dalek.workspace = true
 base64.workspace = true
-sha2.workspace = true
 rand.workspace = true
+anyhow.workspace = true

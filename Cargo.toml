@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/marg_domain",
-    "crates/marg_application",
-    "crates/marg_adapters",
-    "crates/marg_licensing_tool",
+    "crates/t3_domain",
+    "crates/t3_application",
+    "crates/t3_adapters",
+    "crates/t3_licensing_tool",
     "src-tauri",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["t3SharePlus Team"]
+authors = ["t3Bridge Team"]
 license = "Proprietary"
 
 [workspace.dependencies]

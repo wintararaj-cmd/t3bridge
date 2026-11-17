@@ -1,6 +1,6 @@
 use crate::ports::{HardwareFingerprintPort, LicenseStoragePort, LicenseVerifierPort};
 use chrono::Utc;
-use marg_domain::{DomainError, DomainResult, License};
+use t3_domain::{DomainError, DomainResult, License};
 use std::sync::Arc;
 
 pub struct ActivateLicenseUseCase {
@@ -51,7 +51,7 @@ impl ActivateLicenseUseCase {
 mod tests {
     use super::*;
     use crate::ports::{MockHardwareFingerprintPort, MockLicenseStoragePort, MockLicenseVerifierPort};
-    use marg_domain::{HardwareId, LicensePayload, LicenseTier};
+    use t3_domain::{HardwareId, LicensePayload, LicenseTier};
 
     #[tokio::test]
     async fn test_successful_activation() {

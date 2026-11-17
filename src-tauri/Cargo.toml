@@ -8,9 +8,9 @@ authors.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-marg_domain = { path = "../crates/marg_domain" }
-marg_application = { path = "../crates/marg_application" }
-marg_adapters = { path = "../crates/marg_adapters" }
+t3_domain = { path = "../crates/t3_domain" }
+t3_application = { path = "../crates/t3_application" }
+t3_adapters = { path = "../crates/t3_adapters" }
 tauri = { version = "2", features = ["tray-icon"] }
 async-trait.workspace = true
 serde.workspace = true

@@ -1,7 +1,7 @@
 use base64::prelude::*;
 use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
-use marg_domain::entity::license::{License, LicensePayload, LicenseTier};
+use t3_domain::entity::license::{License, LicensePayload, LicenseTier};
 use rand::rngs::OsRng;
 use std::env;
 use std::fs;
@@ -11,7 +11,7 @@ fn main() -> anyhow::Result<()> {
 
     if args.len() < 2 {
         println!("========================================================");
-        println!("        t3SharePlus - Commercial License Generator       ");
+        println!("          t3Bridge - Commercial License Generator       ");
         println!("========================================================");
         println!("Usage:");
         println!("  licgen keygen                          -> Generates new Keypair");

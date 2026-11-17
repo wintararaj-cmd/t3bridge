@@ -1,5 +1,5 @@
 use crate::ports::{TunnelPort, WindowsSystemPort};
-use marg_domain::{
+use t3_domain::{
     AppProfile, ConnectionMachine, DomainError, DomainResult, Peer,
 };
 use std::sync::Arc;
@@ -84,7 +84,7 @@ impl ConnectToHostUseCase {
 mod tests {
     use super::*;
     use crate::ports::{MockTunnelPort, MockWindowsSystemPort};
-    use marg_domain::{PeerRole, VirtualIp};
+    use t3_domain::{PeerRole, VirtualIp};
 
     fn dummy_peer() -> Peer {
         Peer::new(

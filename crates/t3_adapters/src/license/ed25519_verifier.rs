@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use base64::prelude::*;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use marg_application::ports::LicenseVerifierPort;
-use marg_domain::{DomainError, DomainResult};
+use t3_application::ports::LicenseVerifierPort;
+use t3_domain::{DomainError, DomainResult};
 
 pub struct Ed25519LicenseVerifier {
     public_key: VerifyingKey,

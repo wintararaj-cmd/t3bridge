@@ -1,5 +1,5 @@
 use crate::ports::{NatTraversalPort, SignalingPort};
-use marg_domain::{DomainResult, HolePunchPayload};
+use t3_domain::{DomainResult, HolePunchPayload};
 use std::sync::Arc;
 
 pub struct PerformHolePunchUseCase {

@@ -1,11 +1,18 @@
 [package]
-name = "marg_domain"
+name = "t3_application"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+t3_domain = { path = "../t3_domain" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+mockall.workspace = true
+tokio-test.workspace = true

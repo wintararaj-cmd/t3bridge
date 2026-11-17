@@ -1,14 +1,14 @@
 use async_trait::async_trait;
-use marg_adapters::{
+use t3_adapters::{
     Ed25519LicenseVerifier, FileLicenseStorage, WindowsHardwareFingerprint, WindowsSystemAdapter,
 };
-use marg_application::ports::{
+use t3_application::ports::{
     HardwareFingerprintPort, LicenseStoragePort, LicenseVerifierPort, TunnelPort, WindowsSystemPort,
 };
-use marg_application::usecases::{
+use t3_application::usecases::{
     ActivateLicenseUseCase, ConnectToHostUseCase, DisconnectSessionUseCase,
 };
-use marg_domain::{
+use t3_domain::{
     AppProfile, DomainResult, License, Peer, PeerRole, TunnelMetrics, VirtualIp,
 };
 use serde::{Deserialize, Serialize};

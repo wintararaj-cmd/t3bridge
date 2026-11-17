@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use marg_application::ports::HardwareFingerprintPort;
-use marg_domain::{DomainResult, HardwareId};
+use t3_application::ports::HardwareFingerprintPort;
+use t3_domain::{DomainResult, HardwareId};
 use sha2::{Digest, Sha256};
 
 pub struct WindowsHardwareFingerprint;

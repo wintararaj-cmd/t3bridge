@@ -4,9 +4,9 @@ You are working on `t3Bridge` — a universal P2P business application bridge wr
 
 ## Core Mandates
 1. **Clean Architecture Boundary:**
-   - `crates/marg_domain` (Domain): Pure entities, value objects, and type-state pattern. ZERO dependencies on OS, Wintun, or network drivers.
-   - `crates/marg_application` (Application): Use cases and Trait Ports. All system, tunnel, and license storage interactions must go through interfaces.
-   - `crates/marg_adapters` (Adapters): Implementations of traits using `windows-rs`, `wintun`, `ed25519-dalek`, `tokio-tungstenite`.
+   - `crates/t3_domain` (Domain): Pure entities, value objects, and type-state pattern. ZERO dependencies on OS, Wintun, or network drivers.
+   - `crates/t3_application` (Application): Use cases and Trait Ports. All system, tunnel, and license storage interactions must go through interfaces.
+   - `crates/t3_adapters` (Adapters): Implementations of traits using `windows-rs`, `wintun`, `ed25519-dalek`, `tokio-tungstenite`.
    - `src-tauri` / Frontend (UI): Presentation only. No business logic in UI commands.
 
 2. **Universal Business App Support (No ERP Hardcoding):**
