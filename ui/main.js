@@ -1,5 +1,9 @@
 // Tauri v2 IPC Bridge
-const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : async (cmd, args) => {
+const invoke = (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
+  ? window.__TAURI__.core.invoke
+  : (window.__TAURI__ && window.__TAURI__.invoke)
+    ? window.__TAURI__.invoke
+    : async (cmd, args) => {
   console.log(`[Mock Invoke] ${cmd}`, args);
   if (cmd === 'get_hardware_id') return "T3-D03F-944C-857E";
   if (cmd === 'get_license_status') return {

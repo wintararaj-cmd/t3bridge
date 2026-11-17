@@ -7,8 +7,10 @@
     "frontendDist": "../ui"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
+        "label": "main",
         "title": "t3Bridge — Universal P2P Business Application Bridge",
         "width": 780,
         "height": 650,

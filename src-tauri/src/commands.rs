@@ -303,7 +303,13 @@ pub const EMBEDDED_PUBLIC_KEY: [u8; 32] = [
 pub fn init_app_state() -> AppState {
     let verifier = Arc::new(Ed25519LicenseVerifier::new(&EMBEDDED_PUBLIC_KEY).unwrap());
     let hwid_provider = Arc::new(WindowsHardwareFingerprint::new());
-    let storage_path = PathBuf::from("license_store.json");
+    
+    let storage_dir = std::env::var("LOCALAPPDATA")
+        .map(|app_data| PathBuf::from(app_data).join("t3Bridge"))
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&storage_dir);
+    let storage_path = storage_dir.join("license_store.json");
+
     let storage = Arc::new(FileLicenseStorage::new(storage_path));
     let system = Arc::new(WindowsSystemAdapter::new());
     let tunnel = Arc::new(NativeP2pTunnel);
