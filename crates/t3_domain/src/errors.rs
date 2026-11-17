@@ -25,6 +25,12 @@ pub enum DomainError {
 
     #[error("Drive letter is already in use: {0}")]
     DriveLetterInUse(char),
+
+    #[error("Network connection failure: {0}")]
+    NetworkFailure(String),
+
+    #[error("Operation timed out: {0}")]
+    Timeout(String),
 }
 
 pub type DomainResult<T> = Result<T, DomainError>;
