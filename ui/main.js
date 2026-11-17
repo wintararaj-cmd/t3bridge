@@ -2,6 +2,15 @@
 const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : async (cmd, args) => {
   console.log(`[Mock Invoke] ${cmd}`, args);
   if (cmd === 'get_hardware_id') return "T3-D03F-944C-857E";
+  if (cmd === 'get_license_status') return {
+    is_licensed: false,
+    is_trial: true,
+    is_expired: false,
+    customer_name: null,
+    tier: "Trial",
+    days_remaining: 7,
+    status_badge_text: "Trial (7 days left)"
+  };
   if (cmd === 'get_session_status') return {
     is_connected: false,
     drive_letter: null,
@@ -42,6 +51,14 @@ const watchdogText = document.getElementById('watchdogText');
 const btnActivateLicense = document.getElementById('btnActivateLicense');
 const licenseInput = document.getElementById('licenseInput');
 const licenseAlert = document.getElementById('licenseAlert');
+
+// Trial & License DOM Elements
+const headerTrialBadge = document.getElementById('headerTrialBadge');
+const trialText = document.getElementById('trialText');
+const trialExpiredBanner = document.getElementById('trialExpiredBanner');
+const btnGoToLicense = document.getElementById('btnGoToLicense');
+const displayLicenseTier = document.getElementById('displayLicenseTier');
+const displayLicenseDetail = document.getElementById('displayLicenseDetail');
 
 // Custom Profile Elements
 const btnToggleNewProfile = document.getElementById('btnToggleNewProfile');
@@ -227,6 +244,7 @@ btnActivateLicense.addEventListener('click', async () => {
     licenseAlert.style.backgroundColor = "rgba(16, 185, 129, 0.2)";
     licenseAlert.style.color = "#10b981";
     licenseAlert.textContent = `License activated successfully for: ${lic.payload.customer_name}!`;
+    await loadLicenseStatus();
   } catch (err) {
     licenseAlert.style.display = "block";
     licenseAlert.style.backgroundColor = "rgba(239, 68, 68, 0.2)";
@@ -234,6 +252,58 @@ btnActivateLicense.addEventListener('click', async () => {
     licenseAlert.textContent = `Activation Failed: ${err}`;
   }
 });
+
+// Load License & 7-Day Trial Status
+async function loadLicenseStatus() {
+  try {
+    const status = await invoke('get_license_status');
+    if (!status) return;
+
+    if (status.is_licensed) {
+      headerTrialBadge.className = "trial-badge licensed";
+      trialText.textContent = "Licensed";
+      trialExpiredBanner.style.display = "none";
+      if (displayLicenseTier) {
+        displayLicenseTier.textContent = `${status.tier} (${status.customer_name || 'Active'})`;
+        displayLicenseTier.className = "tier-pill licensed";
+        displayLicenseDetail.textContent = "Commercial license active with unrestricted P2P access.";
+      }
+      btnConnect.disabled = false;
+    } else if (status.is_trial && !status.is_expired) {
+      headerTrialBadge.className = "trial-badge";
+      trialText.textContent = `Trial (${status.days_remaining}d left)`;
+      trialExpiredBanner.style.display = "none";
+      if (displayLicenseTier) {
+        displayLicenseTier.textContent = `Free Trial (${status.days_remaining} days left)`;
+        displayLicenseTier.className = "tier-pill";
+        displayLicenseDetail.textContent = "7-day free evaluation period active with full feature access.";
+      }
+      btnConnect.disabled = false;
+    } else {
+      headerTrialBadge.className = "trial-badge expired";
+      trialText.textContent = "Trial Expired";
+      trialExpiredBanner.style.display = "flex";
+      if (displayLicenseTier) {
+        displayLicenseTier.textContent = "Trial Expired";
+        displayLicenseTier.className = "tier-pill expired";
+        displayLicenseDetail.textContent = "Your 7-day free trial has expired. Activate a license to continue using t3Bridge.";
+      }
+      btnConnect.disabled = true;
+    }
+  } catch (err) {
+    console.error("License status check error", err);
+  }
+}
+
+if (btnGoToLicense) {
+  btnGoToLicense.addEventListener('click', () => {
+    tabBtns.forEach(b => b.classList.remove('active'));
+    tabPanes.forEach(p => p.classList.remove('active'));
+    const licTab = document.querySelector('[data-tab="tab-license"]');
+    if (licTab) licTab.classList.add('active');
+    document.getElementById('tab-license').classList.add('active');
+  });
+}
 
 function updateUiStatus(status) {
   const connected = status.is_connected;
@@ -295,3 +365,4 @@ setInterval(async () => {
 // Initialize on page load
 renderProfiles();
 loadHwid();
+loadLicenseStatus();

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use t3_domain::{DomainResult, HardwareId, License};
+use t3_domain::{DomainResult, HardwareId, License, TrialInfo};
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -22,4 +22,8 @@ pub trait LicenseStoragePort: Send + Sync {
     async fn save_license(&self, license: &License) -> DomainResult<()>;
     /// Loads the stored license from disk
     async fn load_license(&self) -> DomainResult<Option<License>>;
+    /// Stores local trial tracking record
+    async fn save_trial(&self, trial: &TrialInfo) -> DomainResult<()>;
+    /// Loads local trial tracking record
+    async fn load_trial(&self) -> DomainResult<Option<TrialInfo>>;
 }

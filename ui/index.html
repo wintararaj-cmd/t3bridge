@@ -17,11 +17,22 @@
           <span>Universal P2P Mesh Network</span>
         </div>
       </div>
-      <div class="status-badge" id="headerStatusBadge">
-        <span class="status-dot disconnected"></span>
-        <span id="statusText">Disconnected</span>
+      <div class="header-badges">
+        <div class="trial-badge" id="headerTrialBadge">
+          <span id="trialText">Free Trial</span>
+        </div>
+        <div class="status-badge" id="headerStatusBadge">
+          <span class="status-dot disconnected"></span>
+          <span id="statusText">Disconnected</span>
+        </div>
       </div>
     </header>
+
+    <!-- Global Trial Expiration Banner -->
+    <div id="trialExpiredBanner" class="trial-expired-banner" style="display: none;">
+      <span>⚠️ <strong>Trial Expired:</strong> Your 7-day evaluation period has ended. Please enter an activation key to connect.</span>
+      <button type="button" id="btnGoToLicense" class="btn btn-secondary btn-sm">Activate</button>
+    </div>
 
     <!-- Navigation Tabs -->
     <nav class="nav-tabs">
@@ -123,6 +134,14 @@
       <!-- Tab 2: License -->
       <section id="tab-license" class="tab-pane">
         <div class="card">
+          <div class="license-status-header">
+            <span>License Status:</span>
+            <strong id="displayLicenseTier" class="tier-pill">Checking...</strong>
+          </div>
+          <div id="displayLicenseDetail" class="sub-description">7-day free trial active.</div>
+
+          <hr class="divider" />
+
           <h3>Machine Fingerprint</h3>
           <p class="description">Send this Hardware ID to your software provider to generate a commercial license.</p>
           <div class="hwid-container">

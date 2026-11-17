@@ -42,6 +42,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_hardware_id,
             get_license_info,
+            get_license_status,
             activate_license,
             get_app_profiles,
             connect_bridge,

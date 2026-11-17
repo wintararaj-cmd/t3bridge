@@ -6,10 +6,12 @@ use t3_application::ports::{
     HardwareFingerprintPort, LicenseStoragePort, LicenseVerifierPort, TunnelPort, WindowsSystemPort,
 };
 use t3_application::usecases::{
-    ActivateLicenseUseCase, ConnectToHostUseCase, DisconnectSessionUseCase, NetworkWatchdogUseCase,
+    ActivateLicenseUseCase, CheckLicenseStatusUseCase, ConnectToHostUseCase,
+    DisconnectSessionUseCase, NetworkWatchdogUseCase,
 };
 use t3_domain::{
-    AppProfile, ConnectionHealth, DomainResult, License, Peer, PeerRole, TunnelMetrics, VirtualIp,
+    AppProfile, ConnectionHealth, DomainResult, License, LicenseStatus, Peer, PeerRole,
+    TunnelMetrics, VirtualIp,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -95,6 +97,70 @@ pub async fn activate_license(
     usecase.execute(&raw_key).await.map_err(|e| e.to_string())
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct UiLicenseStatus {
+    pub is_licensed: bool,
+    pub is_trial: bool,
+    pub is_expired: bool,
+    pub customer_name: Option<String>,
+    pub tier: String,
+    pub days_remaining: u32,
+    pub status_badge_text: String,
+}
+
+#[tauri::command]
+pub async fn get_license_status(state: tauri::State<'_, AppState>) -> Result<UiLicenseStatus, String> {
+    let usecase = CheckLicenseStatusUseCase::new(
+        Arc::clone(&state.hwid_provider),
+        Arc::clone(&state.storage),
+    );
+
+    let status = usecase.execute().await.map_err(|e| e.to_string())?;
+
+    match status {
+        LicenseStatus::Licensed {
+            customer_name,
+            tier,
+            ..
+        } => Ok(UiLicenseStatus {
+            is_licensed: true,
+            is_trial: false,
+            is_expired: false,
+            customer_name: Some(customer_name),
+            tier: format!("{:?}", tier),
+            days_remaining: 0,
+            status_badge_text: "Licensed".into(),
+        }),
+        LicenseStatus::TrialActive { days_left } => Ok(UiLicenseStatus {
+            is_licensed: false,
+            is_trial: true,
+            is_expired: false,
+            customer_name: None,
+            tier: "Trial".into(),
+            days_remaining: days_left,
+            status_badge_text: format!("Trial ({} days left)", days_left),
+        }),
+        LicenseStatus::TrialExpired => Ok(UiLicenseStatus {
+            is_licensed: false,
+            is_trial: true,
+            is_expired: true,
+            customer_name: None,
+            tier: "Trial Expired".into(),
+            days_remaining: 0,
+            status_badge_text: "Trial Expired".into(),
+        }),
+        LicenseStatus::TrialTampered => Ok(UiLicenseStatus {
+            is_licensed: false,
+            is_trial: true,
+            is_expired: true,
+            customer_name: None,
+            tier: "Clock Tampered".into(),
+            days_remaining: 0,
+            status_badge_text: "Clock Error".into(),
+        }),
+    }
+}
+
 #[tauri::command]
 pub fn get_app_profiles() -> Vec<AppProfile> {
     vec![
@@ -113,6 +179,19 @@ pub async fn connect_bridge(
     drive_letter: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    // 1. Enforce 7-Day Free Trial / Commercial License check
+    let license_check = CheckLicenseStatusUseCase::new(
+        Arc::clone(&state.hwid_provider),
+        Arc::clone(&state.storage),
+    );
+    let license_status = license_check.execute().await.map_err(|e| e.to_string())?;
+    if !license_status.is_allowed_to_connect() {
+        return Err(
+            "Your 7-day free trial has expired! Please activate a commercial license in the License tab to connect."
+                .into(),
+        );
+    }
+
     let letter = drive_letter
         .chars()
         .next()
