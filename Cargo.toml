@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/marg_domain",
+    "crates/marg_application",
+    "crates/marg_adapters",
+    "crates/marg_licensing_tool",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["t3SharePlus Team"]
+license = "Proprietary"
+
+[workspace.dependencies]
+# Serialization & Types
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Async & Networking
+tokio = { version = "1.38", features = ["full"] }
+async-trait = "0.1"
+
+# Cryptography & Licensing
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+
+# Testing & Mocks (TDD)
+mockall = "0.13"
+tokio-test = "0.4"

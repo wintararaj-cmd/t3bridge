@@ -1,0 +1,10 @@
+[package]
+name = "marg_domain"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
