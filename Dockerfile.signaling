@@ -9,8 +9,12 @@ WORKDIR /usr/src/t3bridge
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
 # Copy workspace definition and all workspace crates
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
+COPY Cargo.lock* ./
 COPY crates ./crates
+
+# Remove GUI desktop crate from workspace members for headless cloud server build
+RUN sed -i '/src-tauri/d' Cargo.toml
 
 # Build only the signaling server in release mode
 RUN cargo build --release -p t3_signaling_server
