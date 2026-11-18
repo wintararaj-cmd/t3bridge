@@ -84,8 +84,8 @@
 
           <div class="grid-2">
             <div class="form-group">
-              <label for="targetPeerId">Office Server / Connect Code</label>
-              <input type="text" id="targetPeerId" class="input-control" placeholder="e.g. OFFICE-HQ-01" value="OFFICE-HQ-01" />
+              <label for="targetPeerId">Office Server (IP or Hostname)</label>
+              <input type="text" id="targetPeerId" class="input-control" placeholder="e.g. 192.168.1.100 or SERVER-PC" value="" />
             </div>
             <div class="form-group">
               <label for="driveLetter">Map Drive Letter</label>
@@ -122,6 +122,112 @@
             <span class="metric-label">Mapped Path</span>
             <span class="metric-value" id="metricPath">None</span>
           </div>
+        </div>
+
+        <!-- Connection Animation Panel -->
+        <div class="connection-animation-panel" id="connectionAnimPanel">
+          <svg id="connectionSvg" viewBox="0 0 700 140" preserveAspectRatio="xMidYMid meet">
+            <!-- Definitions for gradients, filters, and animated elements -->
+            <defs>
+              <!-- Glow filter for computers -->
+              <filter id="glowFilter" x="-50%" y="-50%" width="200%" height="200%">
+                <feGaussianBlur stdDeviation="3" result="blur" />
+                <feMerge>
+                  <feMergeNode in="blur" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
+              <!-- Glow for connected state -->
+              <filter id="greenGlow" x="-50%" y="-50%" width="200%" height="200%">
+                <feGaussianBlur stdDeviation="4" result="blur" />
+                <feMerge>
+                  <feMergeNode in="blur" />
+                  <feMergeNode in="SourceGraphic" />
+                </feMerge>
+              </filter>
+              <!-- Packet gradient -->
+              <linearGradient id="packetGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:0" />
+                <stop offset="50%" style="stop-color:#ec4899;stop-opacity:1" />
+                <stop offset="100%" style="stop-color:#3b82f6;stop-opacity:0" />
+              </linearGradient>
+              <linearGradient id="packetGradReverse" x1="100%" y1="0%" x2="0%" y2="0%">
+                <stop offset="0%" style="stop-color:#ec4899;stop-opacity:0" />
+                <stop offset="50%" style="stop-color:#3b82f6;stop-opacity:1" />
+                <stop offset="100%" style="stop-color:#ec4899;stop-opacity:0" />
+              </linearGradient>
+              <!-- Connection line gradient -->
+              <linearGradient id="lineGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:0.6" />
+                <stop offset="50%" style="stop-color:#ec4899;stop-opacity:0.8" />
+                <stop offset="100%" style="stop-color:#3b82f6;stop-opacity:0.6" />
+              </linearGradient>
+              <linearGradient id="lineGradConnected" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" style="stop-color:#10b981;stop-opacity:0.8" />
+                <stop offset="50%" style="stop-color:#34d399;stop-opacity:1" />
+                <stop offset="100%" style="stop-color:#10b981;stop-opacity:0.8" />
+              </linearGradient>
+            </defs>
+
+            <!-- Left Computer (Client / Branch) -->
+            <g id="leftComputer" class="computer-group" transform="translate(60, 25)">
+              <!-- Monitor -->
+              <rect x="0" y="0" width="80" height="55" rx="6" ry="6" fill="#1e293b" stroke="#334155" stroke-width="1.5" />
+              <rect x="5" y="5" width="70" height="40" rx="3" ry="3" fill="#0f172a" id="leftScreen" />
+              <!-- Screen content - terminal lines -->
+              <line x1="12" y1="16" x2="45" y2="16" stroke="#3b82f6" stroke-width="1.5" opacity="0.6" />
+              <line x1="12" y1="22" x2="55" y2="22" stroke="#64748b" stroke-width="1.5" opacity="0.4" />
+              <line x1="12" y1="28" x2="38" y2="28" stroke="#64748b" stroke-width="1.5" opacity="0.4" />
+              <line x1="12" y1="34" x2="50" y2="34" stroke="#ec4899" stroke-width="1.5" opacity="0.5" id="leftCursor" />
+              <!-- Stand -->
+              <rect x="28" y="55" width="24" height="5" rx="1" fill="#334155" />
+              <rect x="22" y="60" width="36" height="4" rx="2" fill="#334155" />
+              <!-- Label -->
+              <text x="40" y="80" text-anchor="middle" fill="#94a3b8" font-size="10" font-weight="600">CLIENT</text>
+            </g>
+
+            <!-- Right Computer (Server / Office HQ) -->
+            <g id="rightComputer" class="computer-group" transform="translate(560, 25)">
+              <!-- Monitor -->
+              <rect x="0" y="0" width="80" height="55" rx="6" ry="6" fill="#1e293b" stroke="#334155" stroke-width="1.5" />
+              <rect x="5" y="5" width="70" height="40" rx="3" ry="3" fill="#0f172a" id="rightScreen" />
+              <!-- Screen content - server rack lines -->
+              <rect x="15" y="14" width="50" height="6" rx="1" fill="#1e293b" stroke="#334155" stroke-width="0.5" />
+              <circle cx="58" cy="17" r="2" fill="#64748b" id="serverLed1" />
+              <rect x="15" y="23" width="50" height="6" rx="1" fill="#1e293b" stroke="#334155" stroke-width="0.5" />
+              <circle cx="58" cy="26" r="2" fill="#64748b" id="serverLed2" />
+              <rect x="15" y="32" width="50" height="6" rx="1" fill="#1e293b" stroke="#334155" stroke-width="0.5" />
+              <circle cx="58" cy="35" r="2" fill="#64748b" id="serverLed3" />
+              <!-- Stand -->
+              <rect x="28" y="55" width="24" height="5" rx="1" fill="#334155" />
+              <rect x="22" y="60" width="36" height="4" rx="2" fill="#334155" />
+              <!-- Label -->
+              <text x="40" y="80" text-anchor="middle" fill="#94a3b8" font-size="10" font-weight="600">SERVER</text>
+            </g>
+
+            <!-- Connection line (dashed when idle, animated when connecting) -->
+            <line id="connLine" x1="145" y1="52" x2="555" y2="52" stroke="#1f293d" stroke-width="2" stroke-dasharray="8 6" />
+
+            <!-- Animated data packets (hidden by default) -->
+            <g id="dataPackets" style="display: none;">
+              <circle class="packet packet-right" cx="145" cy="48" r="4" fill="url(#packetGrad)" filter="url(#glowFilter)" />
+              <circle class="packet packet-right delay1" cx="145" cy="48" r="3" fill="url(#packetGrad)" filter="url(#glowFilter)" />
+              <circle class="packet packet-right delay2" cx="145" cy="48" r="3.5" fill="url(#packetGrad)" filter="url(#glowFilter)" />
+              <circle class="packet packet-left" cx="555" cy="56" r="3.5" fill="url(#packetGradReverse)" filter="url(#glowFilter)" />
+              <circle class="packet packet-left delay1" cx="555" cy="56" r="3" fill="url(#packetGradReverse)" filter="url(#glowFilter)" />
+            </g>
+
+            <!-- Connection established checkmark (hidden by default) -->
+            <g id="connEstablished" style="display: none;" transform="translate(350, 52)">
+              <circle cx="0" cy="0" r="16" fill="rgba(16, 185, 129, 0.15)" stroke="#10b981" stroke-width="1.5" />
+              <path d="M-6,0 L-2,5 L7,-5" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+            </g>
+
+            <!-- Status text -->
+            <text id="connStatusText" x="350" y="120" text-anchor="middle" fill="#475569" font-size="11" font-weight="600" letter-spacing="1">
+              AWAITING CONNECTION
+            </text>
+          </svg>
         </div>
 
         <!-- Watchdog Stability Banner -->

@@ -4,11 +4,24 @@ use t3_domain::{DomainError, DomainResult};
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 pub struct WindowsSystemAdapter;
 
 impl WindowsSystemAdapter {
     pub fn new() -> Self {
         Self
+    }
+
+    fn hidden_command(program: &str) -> Command {
+        let mut cmd = Command::new(program);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
     }
 }
 
@@ -24,7 +37,7 @@ impl WindowsSystemPort for WindowsSystemAdapter {
         let drive_spec = format!("{}:", letter.to_ascii_uppercase());
 
         // Run: net use Z: \\10.99.0.1\Share /persistent:no
-        let output = Command::new("net")
+        let output = Self::hidden_command("net")
             .args(["use", &drive_spec, unc_path, "/persistent:no"])
             .output()
             .map_err(|e| DomainError::InvalidIpAddress(format!("Failed to spawn 'net use': {}", e)))?;
@@ -45,7 +58,7 @@ impl WindowsSystemPort for WindowsSystemAdapter {
         let drive_spec = format!("{}:", letter.to_ascii_uppercase());
 
         // Run: net use Z: /delete /y
-        let _ = Command::new("net")
+        let _ = Self::hidden_command("net")
             .args(["use", &drive_spec, "/delete", "/y"])
             .output();
 
@@ -60,7 +73,7 @@ impl WindowsSystemPort for WindowsSystemAdapter {
 
     async fn configure_firewall_rule(&self, subnet_cidr: &str) -> DomainResult<()> {
         // Run: netsh advfirewall firewall add rule name="t3Bridge-SMB" dir=in action=allow protocol=TCP localport=445 remoteip=10.99.0.0/24
-        let _ = Command::new("netsh")
+        let _ = Self::hidden_command("netsh")
             .args([
                 "advfirewall",
                 "firewall",

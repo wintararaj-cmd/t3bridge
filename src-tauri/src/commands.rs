@@ -50,6 +50,7 @@ pub struct AppState {
     pub tunnel: Arc<dyn TunnelPort>,
     pub active_drive: Mutex<Option<char>>,
     pub is_connected: Mutex<bool>,
+    pub active_unc: Mutex<Option<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -164,6 +165,8 @@ pub async fn get_license_status(state: tauri::State<'_, AppState>) -> Result<UiL
 #[tauri::command]
 pub fn get_app_profiles() -> Vec<AppProfile> {
     vec![
+        AppProfile::custom("Marg ERP 9+ (Share: MargERP)", "MargERP", 'Z'),
+        AppProfile::custom("Marg ERP (Share: MARG)", "MARG", 'Z'),
         AppProfile::primary_erp(),
         AppProfile::branch_share(),
         AppProfile::custom("General SMB Network Share", "Share", 'W'),
@@ -192,6 +195,11 @@ pub async fn connect_bridge(
         );
     }
 
+    let host_input = target_peer_id.trim();
+    if host_input.is_empty() {
+        return Err("Please enter the Server IP or Hostname (e.g. 192.168.1.100 or SERVER-PC).".into());
+    }
+
     let letter = drive_letter
         .chars()
         .next()
@@ -208,7 +216,28 @@ pub async fn connect_bridge(
             .unwrap_or_else(AppProfile::primary_erp)
     };
 
-    let virtual_ip = VirtualIp::new("10.99.0.1", 24).map_err(|e| e.to_string())?;
+    // Determine target IP: direct IPv4 or resolve hostname on LAN
+    let target_ip = if let Ok(ip) = host_input.parse::<std::net::Ipv4Addr>() {
+        ip.to_string()
+    } else {
+        use std::net::ToSocketAddrs;
+        let resolved = format!("{}:445", host_input)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| {
+                addrs.find_map(|sa| {
+                    if let std::net::SocketAddr::V4(v4) = sa {
+                        Some(v4.ip().to_string())
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        resolved.unwrap_or_else(|| "10.99.0.1".to_string())
+    };
+
+    let virtual_ip = VirtualIp::new(&target_ip, 24).map_err(|e| e.to_string())?;
     let dummy_peer = Peer::new(
         target_peer_id,
         "Office Server".into(),
@@ -228,6 +257,7 @@ pub async fn connect_bridge(
 
     *state.active_drive.lock().await = Some(letter);
     *state.is_connected.lock().await = true;
+    *state.active_unc.lock().await = Some(res.session_unc_path.clone());
 
     Ok(format!("Connected! Drive {}: mapped to {}", res.drive_letter, res.session_unc_path))
 }
@@ -244,6 +274,7 @@ pub async fn disconnect_bridge(state: tauri::State<'_, AppState>) -> Result<(), 
 
     *state.active_drive.lock().await = None;
     *state.is_connected.lock().await = false;
+    *state.active_unc.lock().await = None;
 
     Ok(())
 }
@@ -252,6 +283,7 @@ pub async fn disconnect_bridge(state: tauri::State<'_, AppState>) -> Result<(), 
 pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiSessionStatus, String> {
     let connected = *state.is_connected.lock().await;
     let drive = *state.active_drive.lock().await;
+    let mapped_unc = state.active_unc.lock().await.clone();
 
     if connected {
         let watchdog = NetworkWatchdogUseCase::new(Arc::clone(&state.tunnel));
@@ -274,7 +306,13 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
         Ok(UiSessionStatus {
             is_connected: true,
             drive_letter: drive,
-            mapped_unc: drive.map(|d| format!(r"\\10.99.0.1\SharedData -> {}:", d)),
+            mapped_unc: drive.map(|d| {
+                if let Some(unc) = &mapped_unc {
+                    format!("{} -> {}:", unc, d)
+                } else {
+                    format!(r"\\10.99.0.1\SharedData -> {}:", d)
+                }
+            }),
             latency_ms: report.metrics.latency_ms,
             status_text: format!("Bridged ({})", health_level),
             health_level,
@@ -322,5 +360,6 @@ pub fn init_app_state() -> AppState {
         tunnel,
         active_drive: Mutex::new(None),
         is_connected: Mutex::new(false),
+        active_unc: Mutex::new(None),
     }
 }

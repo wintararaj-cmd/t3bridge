@@ -1,0 +1,38 @@
+# -------------------------------------------------------------
+# Stage 1: Build the Rust binary in a full toolchain container
+# -------------------------------------------------------------
+FROM rust:1.80-slim as builder
+
+WORKDIR /usr/src/t3bridge
+
+# Install build essentials and SSL development headers
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+# Copy workspace definition and all workspace crates
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build only the signaling server in release mode
+RUN cargo build --release -p t3_signaling_server
+
+# -------------------------------------------------------------
+# Stage 2: Minimal, secure runtime image
+# -------------------------------------------------------------
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# Install CA certificates for secure TLS connections
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Copy the compiled binary from the builder stage
+COPY --from=builder /usr/src/t3bridge/target/release/t3_signaling_server /usr/local/bin/t3_signaling_server
+
+# Render dynamically injects the PORT environment variable (default: 8088 / 10000)
+ENV PORT=10000
+
+# Expose the port for documentation
+EXPOSE 10000
+
+# Run the cloud signaling rendezvous server
+CMD ["t3_signaling_server"]

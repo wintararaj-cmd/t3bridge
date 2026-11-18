@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: t3bridge-signaling
+    runtime: docker
+    dockerfilePath: ./Dockerfile.signaling
+    plan: free
+    region: singapore
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000

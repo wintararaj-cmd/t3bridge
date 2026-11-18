@@ -195,10 +195,86 @@ btnCopyHwid.addEventListener('click', () => {
   setTimeout(() => btnCopyHwid.textContent = "Copy HWID", 2000);
 });
 
+// Connection Animation Elements
+const connAnimPanel = document.getElementById('connectionAnimPanel');
+const connLine = document.getElementById('connLine');
+const dataPackets = document.getElementById('dataPackets');
+const connEstablished = document.getElementById('connEstablished');
+const connStatusText = document.getElementById('connStatusText');
+const leftScreen = document.getElementById('leftScreen');
+const rightScreen = document.getElementById('rightScreen');
+const serverLed1 = document.getElementById('serverLed1');
+const serverLed2 = document.getElementById('serverLed2');
+const serverLed3 = document.getElementById('serverLed3');
+
+function setAnimationIdle() {
+  connAnimPanel.classList.remove('connecting', 'connected');
+  connLine.setAttribute('class', '');
+  connLine.setAttribute('stroke', '#1f293d');
+  connLine.setAttribute('stroke-width', '2');
+  connLine.setAttribute('stroke-dasharray', '8 6');
+  dataPackets.style.display = 'none';
+  connEstablished.style.display = 'none';
+  connEstablished.setAttribute('class', '');
+  connStatusText.textContent = 'AWAITING CONNECTION';
+  connStatusText.setAttribute('class', '');
+  leftScreen.setAttribute('class', '');
+  rightScreen.setAttribute('class', '');
+  serverLed1.setAttribute('class', '');
+  serverLed2.setAttribute('class', '');
+  serverLed3.setAttribute('class', '');
+  serverLed1.setAttribute('fill', '#64748b');
+  serverLed2.setAttribute('fill', '#64748b');
+  serverLed3.setAttribute('fill', '#64748b');
+}
+
+function setAnimationConnecting() {
+  connAnimPanel.classList.remove('connected');
+  connAnimPanel.classList.add('connecting');
+  connLine.setAttribute('class', 'conn-line-connecting');
+  dataPackets.style.display = 'block';
+  connEstablished.style.display = 'none';
+  connStatusText.textContent = 'ESTABLISHING P2P BRIDGE...';
+  connStatusText.setAttribute('class', 'status-text-connecting');
+  leftScreen.setAttribute('class', 'screen-connecting');
+  rightScreen.setAttribute('class', 'screen-connecting');
+  serverLed1.setAttribute('class', 'led-active');
+  serverLed2.setAttribute('class', 'led-active');
+  serverLed2.style.animationDelay = '0.2s';
+  serverLed3.setAttribute('class', 'led-active');
+  serverLed3.style.animationDelay = '0.4s';
+}
+
+function setAnimationConnected() {
+  connAnimPanel.classList.remove('connecting');
+  connAnimPanel.classList.add('connected');
+  connLine.setAttribute('class', 'conn-line-connected');
+  dataPackets.style.display = 'none';
+  connEstablished.style.display = 'block';
+  connEstablished.setAttribute('class', 'checkmark-enter');
+  connStatusText.textContent = '✓ CONNECTION ESTABLISHED';
+  connStatusText.setAttribute('class', 'status-text-connected');
+  leftScreen.setAttribute('class', 'screen-connected');
+  rightScreen.setAttribute('class', 'screen-connected');
+  serverLed1.setAttribute('class', 'led-connected');
+  serverLed2.setAttribute('class', 'led-connected');
+  serverLed3.setAttribute('class', 'led-connected');
+}
+
 // 3. Connect Bridge
 btnConnect.addEventListener('click', async () => {
+  const hostVal = targetPeerId.value.trim();
+  if (!hostVal) {
+    alert("Please enter the Office Server IP address or Hostname (e.g. 192.168.1.100 or SERVER-PC).");
+    targetPeerId.focus();
+    return;
+  }
+
   btnConnect.disabled = true;
   btnConnect.textContent = "Connecting...";
+
+  // Start the connecting animation
+  setAnimationConnecting();
 
   try {
     const selectedOpt = appProfileSelect.options[appProfileSelect.selectedIndex];
@@ -216,8 +292,14 @@ btnConnect.addEventListener('click', async () => {
 
     isConnected = true;
     const status = await invoke('get_session_status');
+
+    // Show connected animation
+    setAnimationConnected();
+
     updateUiStatus(status);
   } catch (err) {
+    // Reset animation on error
+    setAnimationIdle();
     alert(`Connection Error: ${err}`);
   } finally {
     btnConnect.disabled = false;
@@ -231,6 +313,7 @@ btnDisconnect.addEventListener('click', async () => {
     await invoke('disconnect_bridge');
     isConnected = false;
     const status = await invoke('get_session_status');
+    setAnimationIdle();
     updateUiStatus(status);
   } catch (err) {
     alert(`Disconnect Error: ${err}`);
@@ -329,6 +412,11 @@ function updateUiStatus(status) {
     else if (status.health_level === "Degraded") metricHealth.classList.add("health-degraded");
     else metricHealth.classList.add("health-unstable");
 
+    // Sync animation to connected state
+    if (!connAnimPanel.classList.contains('connected')) {
+      setAnimationConnected();
+    }
+
     if (status.alert_message) {
       watchdogBanner.style.display = "flex";
       watchdogText.textContent = status.alert_message;
@@ -352,6 +440,11 @@ function updateUiStatus(status) {
     metricIp.textContent = "--";
     metricPath.textContent = "None";
     watchdogBanner.style.display = "none";
+
+    // Sync animation to idle state
+    if (connAnimPanel.classList.contains('connected') || connAnimPanel.classList.contains('connecting')) {
+      setAnimationIdle();
+    }
   }
 }
 

@@ -2,12 +2,30 @@ use crate::registry::PeerRegistry;
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use t3_domain::SignalingMessage;
 
-pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry: Arc<PeerRegistry>) {
+pub async fn handle_connection(mut raw_stream: TcpStream, addr: SocketAddr, registry: Arc<PeerRegistry>) {
+    // 1. Check for standard HTTP health-check requests (Render / uptime checks / browser visits)
+    let mut peek_buf = [0u8; 1024];
+    let n = raw_stream.peek(&mut peek_buf).await.unwrap_or(0);
+    let peek_str = String::from_utf8_lossy(&peek_buf[..n]);
+
+    if peek_str.starts_with("GET ") && !peek_str.to_lowercase().contains("upgrade: websocket") {
+        let body = "{\"status\":\"ok\",\"service\":\"t3Bridge Cloud Signaling Rendezvous Server\"}\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = raw_stream.write_all(response.as_bytes()).await;
+        let _ = raw_stream.flush().await;
+        return;
+    }
+
     let ws_stream = match tokio_tungstenite::accept_async(raw_stream).await {
         Ok(ws) => ws,
         Err(e) => {
