@@ -289,12 +289,24 @@
               <strong class="info-code" id="hostConnectCode">OFFICE-HQ-01</strong>
             </div>
             <div class="info-item">
+              <span class="info-label">Cloud Signaling Server:</span>
+              <span class="badge-success">wss://t3bridge-signaling.onrender.com</span>
+            </div>
+            <div class="info-item">
               <span class="info-label">Active Virtual Subnet:</span>
               <span>10.99.0.1/24</span>
             </div>
             <div class="info-item">
               <span class="info-label">Status:</span>
-              <span class="badge-success">Broadcasting on P2P Mesh</span>
+              <span class="badge-success">Broadcasting on Cloud P2P Mesh</span>
+            </div>
+          </div>
+
+          <div class="form-group" style="margin-top: 16px;">
+            <label for="signalingServerUrl">Cloud Signaling Server (Render / WAN)</label>
+            <input type="text" id="signalingServerUrl" class="input-control" value="wss://t3bridge-signaling.onrender.com" />
+            <div class="sub-text" style="margin-top: 4px; font-size: 11px; color: #94a3b8;">
+              Live cloud rendezvous endpoint for remote branch and WAN connections.
             </div>
           </div>
         </div>

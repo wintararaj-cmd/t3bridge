@@ -53,6 +53,17 @@ const watchdogBanner = document.getElementById('watchdogBanner');
 const watchdogIcon = document.getElementById('watchdogIcon');
 const watchdogText = document.getElementById('watchdogText');
 const btnActivateLicense = document.getElementById('btnActivateLicense');
+const signalingServerUrl = document.getElementById('signalingServerUrl');
+
+if (signalingServerUrl) {
+  const savedSignaling = localStorage.getItem('t3_signaling_url');
+  if (savedSignaling) {
+    signalingServerUrl.value = savedSignaling;
+  }
+  signalingServerUrl.addEventListener('change', () => {
+    localStorage.setItem('t3_signaling_url', signalingServerUrl.value.trim());
+  });
+}
 const licenseInput = document.getElementById('licenseInput');
 const licenseAlert = document.getElementById('licenseAlert');
 
@@ -287,7 +298,8 @@ btnConnect.addEventListener('click', async () => {
       appId: appProfileSelect.value,
       customName: customName,
       customShare: customShare,
-      driveLetter: driveLetter.value
+      driveLetter: driveLetter.value,
+      signalingUrl: signalingServerUrl ? signalingServerUrl.value.trim() : null
     });
 
     isConnected = true;

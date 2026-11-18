@@ -180,8 +180,10 @@ pub async fn connect_bridge(
     custom_name: Option<String>,
     custom_share: Option<String>,
     drive_letter: String,
+    signaling_url: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    let _active_signaling = signaling_url.unwrap_or_else(|| "wss://t3bridge-signaling.onrender.com".to_string());
     // 1. Enforce 7-Day Free Trial / Commercial License check
     let license_check = CheckLicenseStatusUseCase::new(
         Arc::clone(&state.hwid_provider),
