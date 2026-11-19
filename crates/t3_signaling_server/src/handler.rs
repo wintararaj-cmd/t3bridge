@@ -130,6 +130,50 @@ pub async fn handle_connection(mut raw_stream: TcpStream, addr: SocketAddr, regi
                                 });
                             }
                         }
+                        SignalingMessage::RelayRequest { target_peer_id, session_id } => {
+                            let source_id = registered_peer_id.clone().unwrap_or_else(|| "anonymous_client".into());
+                            registry.register_relay_session(session_id.clone(), source_id, target_peer_id.clone()).await;
+                            let relayed = registry
+                                .route_message(
+                                    &target_peer_id,
+                                    SignalingMessage::RelayRequest {
+                                        target_peer_id: target_peer_id.clone(),
+                                        session_id: session_id.clone(),
+                                    },
+                                )
+                                .await;
+                            if !relayed {
+                                let _ = tx.send(SignalingMessage::Error {
+                                    code: "PEER_OFFLINE".into(),
+                                    message: format!("Target host '{}' is offline", target_peer_id),
+                                });
+                            }
+                        }
+                        SignalingMessage::RelayAccepted { session_id } => {
+                            let sender_id = registered_peer_id.as_deref();
+                            if let Some(counterpart) = registry.get_relay_counterpart(&session_id, sender_id).await {
+                                let _ = registry
+                                    .route_message(&counterpart, SignalingMessage::RelayAccepted { session_id })
+                                    .await;
+                            }
+                        }
+                        SignalingMessage::RelayData { session_id, chunk } => {
+                            let sender_id = registered_peer_id.as_deref();
+                            if let Some(counterpart) = registry.get_relay_counterpart(&session_id, sender_id).await {
+                                let _ = registry
+                                    .route_message(&counterpart, SignalingMessage::RelayData { session_id, chunk })
+                                    .await;
+                            }
+                        }
+                        SignalingMessage::RelayClose { session_id } => {
+                            let sender_id = registered_peer_id.as_deref();
+                            if let Some(counterpart) = registry.get_relay_counterpart(&session_id, sender_id).await {
+                                let _ = registry
+                                    .route_message(&counterpart, SignalingMessage::RelayClose { session_id: session_id.clone() })
+                                    .await;
+                            }
+                            registry.remove_relay_session(&session_id).await;
+                        }
                         SignalingMessage::Ping { peer_id: _ } => {
                             let _ = tx.send(SignalingMessage::Pong {
                                 timestamp: chrono::Utc::now().timestamp(),

@@ -43,7 +43,28 @@ pub enum SignalingMessage {
         answer: HolePunchPayload,
     },
 
-    // 4. Connection Keepalive
+    // 4. WAN Relay — SMB-over-WebSocket (TURN-style)
+    /// Client requests a relay session through the signaling server to a registered host
+    RelayRequest {
+        target_peer_id: String,
+        session_id: String,
+    },
+    /// Server signals it has accepted and is ready to relay
+    RelayAccepted {
+        session_id: String,
+    },
+    /// Binary SMB data chunk tunnelled through the signaling server relay
+    RelayData {
+        session_id: String,
+        #[serde(with = "base64_bytes")]
+        chunk: Vec<u8>,
+    },
+    /// Either side signals relay session teardown
+    RelayClose {
+        session_id: String,
+    },
+
+    // 5. Connection Keepalive
     Ping {
         peer_id: String,
     },
@@ -51,11 +72,26 @@ pub enum SignalingMessage {
         timestamp: i64,
     },
 
-    // 5. Error Reporting
+    // 6. Error Reporting
     Error {
         code: String,
         message: String,
     },
+}
+
+/// Base64 serde helper for binary relay chunks (JSON transport)
+mod base64_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        STANDARD.decode(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 #[cfg(test)]

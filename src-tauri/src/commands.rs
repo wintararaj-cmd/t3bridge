@@ -1,7 +1,6 @@
-use async_trait::async_trait;
 use t3_adapters::{
     Ed25519LicenseVerifier, FileLicenseStorage, WebSocketSignalingClient, WindowsHardwareFingerprint,
-    WindowsSystemAdapter,
+    WindowsSystemAdapter, WintunTunnelAdapter,
 };
 use t3_application::ports::{
     HardwareFingerprintPort, LicenseStoragePort, LicenseVerifierPort, SignalingPort, TunnelPort,
@@ -12,7 +11,7 @@ use t3_application::usecases::{
     DisconnectSessionUseCase, NetworkWatchdogUseCase,
 };
 use t3_domain::{
-    AppProfile, ConnectionHealth, DomainResult, License, LicenseStatus, Peer, PeerRole,
+    AppProfile, ConnectionHealth, License, LicenseStatus, Peer, PeerRole,
     SignalingMessage, TunnelMetrics, VirtualIp,
 };
 use serde::{Deserialize, Serialize};
@@ -20,40 +19,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-// Mock Tunnel for local UI preview until kernel Wintun adapter is connected
-struct NativeP2pTunnel;
-
-#[async_trait]
-impl TunnelPort for NativeP2pTunnel {
-    async fn start_adapter(&self, _local_ip: VirtualIp) -> DomainResult<()> {
-        Ok(())
-    }
-    async fn connect_peer(&self, _peer: &Peer, _remote_endpoint: &str) -> DomainResult<()> {
-        Ok(())
-    }
-    async fn disconnect(&self) -> DomainResult<()> {
-        Ok(())
-    }
-    async fn get_metrics(&self) -> DomainResult<TunnelMetrics> {
-        Ok(TunnelMetrics {
-            latency_ms: 18,
-            bytes_sent: 1048576,
-            bytes_received: 4194304,
-            packet_loss_percent: 0,
-        })
-    }
-}
-
 pub struct AppState {
     pub hwid_provider: Arc<dyn HardwareFingerprintPort>,
     pub verifier: Arc<dyn LicenseVerifierPort>,
     pub storage: Arc<dyn LicenseStoragePort>,
     pub system: Arc<dyn WindowsSystemPort>,
-    pub tunnel: Arc<dyn TunnelPort>,
+    pub tunnel: Arc<WintunTunnelAdapter>,
     pub active_drive: Mutex<Option<char>>,
     pub is_connected: Mutex<bool>,
     pub active_unc: Mutex<Option<String>>,
     pub host_signaling: Mutex<Option<Arc<WebSocketSignalingClient>>>,
+    pub client_signaling: Mutex<Option<Arc<WebSocketSignalingClient>>>,
     pub is_hosting: Mutex<bool>,
     pub host_code: Mutex<String>,
 }
@@ -272,7 +248,7 @@ pub async fn connect_bridge(
             )
         } else {
             // Case 3: Connect Code via Cloud Signaling Rendezvous Server (Render)
-            let client = WebSocketSignalingClient::new();
+            let client = Arc::new(WebSocketSignalingClient::new());
             client.connect(&active_signaling).await.map_err(|e| {
                 format!(
                     "Cannot reach Cloud Signaling Server ({}): {}\nPlease check your internet connection.",
@@ -287,12 +263,56 @@ pub async fn connect_bridge(
                 )
             })?;
 
+            // Setup WAN Relay over WebSocket
+            let session_id = format!("sess_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+            let _ = client.send_message(SignalingMessage::RelayRequest {
+                target_peer_id: host_input.to_string(),
+                session_id: session_id.clone(),
+            }).await;
+
+            let inbound_rx = client.take_inbound_receiver().await;
+            let tunnel_for_client = Arc::clone(&state.tunnel);
+            let client_sender = client.get_sender().await;
+
+            if let (Some(mut rx), Some(tx)) = (inbound_rx, client_sender) {
+                let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                tunnel_for_client.set_outbound_channel(out_tx);
+                let sess_clone = session_id.clone();
+
+                // Pump outbound packets from client Wintun to server via RelayData
+                tokio::spawn(async move {
+                    while let Some(packet) = out_rx.recv().await {
+                        let _ = tx.send(SignalingMessage::RelayData {
+                            session_id: sess_clone.clone(),
+                            chunk: packet,
+                        });
+                    }
+                });
+
+                // Pump inbound RelayData from server to client Wintun
+                tokio::spawn(async move {
+                    while let Some(msg) = rx.recv().await {
+                        match msg {
+                            SignalingMessage::RelayData { session_id: _, chunk } => {
+                                let _ = tunnel_for_client.inject_inbound_packet(&chunk);
+                            }
+                            SignalingMessage::RelayClose { session_id: _ } => {
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+
+            *state.client_signaling.lock().await = Some(Arc::clone(&client));
+
             found_host
         }
     };
 
     let usecase = ConnectToHostUseCase::new(
-        Arc::clone(&state.tunnel),
+        Arc::clone(&state.tunnel) as Arc<dyn TunnelPort>,
         Arc::clone(&state.system),
     );
 
@@ -349,8 +369,59 @@ pub async fn start_host_mode(
         .await
         .map_err(|e| format!("Registration failed on signaling server: {}", e))?;
 
-    // Configure Windows Firewall rule for SMB
+    // 1. Configure Windows Firewall rule for SMB
     let _ = state.system.configure_firewall_rule("10.99.0.0/24").await;
+
+    // 2. Start server Wintun adapter with 10.99.0.1
+    let _ = state.tunnel.start_adapter(VirtualIp::new("10.99.0.1", 24).unwrap()).await;
+
+    // 3. Setup WAN Relay message pump
+    let inbound_rx = client.take_inbound_receiver().await;
+    let tunnel_for_host = Arc::clone(&state.tunnel);
+    let client_sender = client.get_sender().await;
+
+    if let (Some(mut rx), Some(tx)) = (inbound_rx, client_sender) {
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tunnel_for_host.set_outbound_channel(out_tx);
+
+        tokio::spawn(async move {
+            let active_session = Arc::new(tokio::sync::Mutex::new(None::<String>));
+            let active_sess_for_out = Arc::clone(&active_session);
+            let tx_for_out = tx.clone();
+
+            // Pump outbound packets from server Wintun to client via RelayData
+            tokio::spawn(async move {
+                while let Some(packet) = out_rx.recv().await {
+                    let sess = active_sess_for_out.lock().await.clone();
+                    if let Some(session_id) = sess {
+                        let _ = tx_for_out.send(SignalingMessage::RelayData {
+                            session_id,
+                            chunk: packet,
+                        });
+                    }
+                }
+            });
+
+            // Pump inbound signaling messages
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    SignalingMessage::RelayRequest { target_peer_id: _, session_id } => {
+                        *active_session.lock().await = Some(session_id.clone());
+                        let _ = tx.send(SignalingMessage::RelayAccepted {
+                            session_id,
+                        });
+                    }
+                    SignalingMessage::RelayData { session_id: _, chunk } => {
+                        let _ = tunnel_for_host.inject_inbound_packet(&chunk);
+                    }
+                    SignalingMessage::RelayClose { session_id: _ } => {
+                        *active_session.lock().await = None;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
 
     *state.host_signaling.lock().await = Some(Arc::clone(&client));
     *state.is_hosting.lock().await = true;
@@ -370,6 +441,7 @@ pub async fn stop_host_mode(state: tauri::State<'_, AppState>) -> Result<(), Str
     if let Some(client) = state.host_signaling.lock().await.take() {
         let _ = client.disconnect().await;
     }
+    let _ = state.tunnel.disconnect().await;
     *state.is_hosting.lock().await = false;
     Ok(())
 }
@@ -395,11 +467,15 @@ pub async fn get_host_status(state: tauri::State<'_, AppState>) -> Result<UiHost
 pub async fn disconnect_bridge(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let drive = *state.active_drive.lock().await;
     let usecase = DisconnectSessionUseCase::new(
-        Arc::clone(&state.tunnel),
+        Arc::clone(&state.tunnel) as Arc<dyn TunnelPort>,
         Arc::clone(&state.system),
     );
 
     usecase.execute(drive).await.map_err(|e| e.to_string())?;
+
+    if let Some(client) = state.client_signaling.lock().await.take() {
+        let _ = client.disconnect().await;
+    }
 
     *state.active_drive.lock().await = None;
     *state.is_connected.lock().await = false;
@@ -415,7 +491,7 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
     let mapped_unc = state.active_unc.lock().await.clone();
 
     if connected {
-        let watchdog = NetworkWatchdogUseCase::new(Arc::clone(&state.tunnel));
+        let watchdog = NetworkWatchdogUseCase::new(Arc::clone(&state.tunnel) as Arc<dyn TunnelPort>);
         let report = watchdog.check_health().await.unwrap_or_else(|_| {
             t3_application::usecases::WatchdogReport {
                 health: ConnectionHealth::Dead,
@@ -479,7 +555,7 @@ pub fn init_app_state() -> AppState {
 
     let storage = Arc::new(FileLicenseStorage::new(storage_path));
     let system = Arc::new(WindowsSystemAdapter::new());
-    let tunnel = Arc::new(NativeP2pTunnel);
+    let tunnel = Arc::new(WintunTunnelAdapter::new());
 
     AppState {
         hwid_provider,
@@ -491,6 +567,7 @@ pub fn init_app_state() -> AppState {
         is_connected: Mutex::new(false),
         active_unc: Mutex::new(None),
         host_signaling: Mutex::new(None),
+        client_signaling: Mutex::new(None),
         is_hosting: Mutex::new(false),
         host_code: Mutex::new("OFFICE-HQ-01".into()),
     }

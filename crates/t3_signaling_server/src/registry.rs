@@ -20,6 +20,7 @@ impl ConnectedPeer {
 pub struct PeerRegistry {
     peers: RwLock<HashMap<String, ConnectedPeer>>,
     next_ip_suffix: RwLock<u8>,
+    relay_sessions: RwLock<HashMap<String, (String, String)>>,
 }
 
 impl PeerRegistry {
@@ -27,6 +28,7 @@ impl PeerRegistry {
         Self {
             peers: RwLock::new(HashMap::new()),
             next_ip_suffix: RwLock::new(2),
+            relay_sessions: RwLock::new(HashMap::new()),
         }
     }
 
@@ -72,8 +74,57 @@ impl PeerRegistry {
     }
 
     pub async fn unregister(&self, peer_id: &str) {
-        let mut map = self.peers.write().await;
-        map.remove(peer_id);
+        {
+            let mut map = self.peers.write().await;
+            map.remove(peer_id);
+        }
+
+        // Notify and clean up any relay sessions involving this peer
+        let mut to_notify = Vec::new();
+        {
+            let mut sessions = self.relay_sessions.write().await;
+            sessions.retain(|sid, (p_a, p_b)| {
+                if p_a == peer_id {
+                    to_notify.push((p_b.clone(), sid.clone()));
+                    false
+                } else if p_b == peer_id {
+                    to_notify.push((p_a.clone(), sid.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        for (counterpart, sid) in to_notify {
+            let _ = self
+                .route_message(&counterpart, SignalingMessage::RelayClose { session_id: sid })
+                .await;
+        }
+    }
+
+    pub async fn register_relay_session(&self, session_id: String, peer_a: String, peer_b: String) {
+        let mut sessions = self.relay_sessions.write().await;
+        sessions.insert(session_id, (peer_a, peer_b));
+    }
+
+    pub async fn get_relay_counterpart(&self, session_id: &str, sender_id: Option<&str>) -> Option<String> {
+        let sessions = self.relay_sessions.read().await;
+        let (p_a, p_b) = sessions.get(session_id)?;
+        if let Some(sender) = sender_id {
+            if sender == p_a {
+                Some(p_b.clone())
+            } else {
+                Some(p_a.clone())
+            }
+        } else {
+            Some(p_a.clone())
+        }
+    }
+
+    pub async fn remove_relay_session(&self, session_id: &str) -> Option<(String, String)> {
+        let mut sessions = self.relay_sessions.write().await;
+        sessions.remove(session_id)
     }
 
     pub async fn find_host(&self, connect_code: &str) -> Option<Peer> {

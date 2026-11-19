@@ -19,6 +19,25 @@ impl WebSocketSignalingClient {
             inbound_rx: Arc::new(Mutex::new(None)),
         }
     }
+
+    pub async fn send_message(&self, msg: SignalingMessage) -> DomainResult<()> {
+        let guard = self.tx.lock().await;
+        if let Some(tx) = guard.as_ref() {
+            tx.send(msg)
+                .map_err(|e| DomainError::NetworkFailure(format!("Failed to send signaling message: {}", e)))?;
+            Ok(())
+        } else {
+            Err(DomainError::NetworkFailure("Signaling client not connected".into()))
+        }
+    }
+
+    pub async fn take_inbound_receiver(&self) -> Option<mpsc::UnboundedReceiver<SignalingMessage>> {
+        self.inbound_rx.lock().await.take()
+    }
+
+    pub async fn get_sender(&self) -> Option<mpsc::UnboundedSender<SignalingMessage>> {
+        self.tx.lock().await.clone()
+    }
 }
 
 impl Default for WebSocketSignalingClient {
