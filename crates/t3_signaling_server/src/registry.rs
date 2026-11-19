@@ -10,6 +10,14 @@ pub struct ConnectedPeer {
     pub remote_addr: SocketAddr,
 }
 
+#[derive(Clone)]
+pub struct RelayPair {
+    pub client_tx: mpsc::UnboundedSender<SignalingMessage>,
+    pub host_tx: mpsc::UnboundedSender<SignalingMessage>,
+    pub client_id: String,
+    pub host_id: String,
+}
+
 #[allow(dead_code)]
 impl ConnectedPeer {
     pub fn remote_addr(&self) -> SocketAddr {
@@ -20,7 +28,7 @@ impl ConnectedPeer {
 pub struct PeerRegistry {
     peers: RwLock<HashMap<String, ConnectedPeer>>,
     next_ip_suffix: RwLock<u8>,
-    relay_sessions: RwLock<HashMap<String, (String, String)>>,
+    relay_sessions: RwLock<HashMap<String, RelayPair>>,
 }
 
 impl PeerRegistry {
@@ -80,15 +88,15 @@ impl PeerRegistry {
         }
 
         // Notify and clean up any relay sessions involving this peer
-        let mut to_notify = Vec::new();
+        let mut to_close = Vec::new();
         {
             let mut sessions = self.relay_sessions.write().await;
-            sessions.retain(|sid, (p_a, p_b)| {
-                if p_a == peer_id {
-                    to_notify.push((p_b.clone(), sid.clone()));
+            sessions.retain(|sid, pair| {
+                if pair.client_id == peer_id {
+                    to_close.push((pair.host_tx.clone(), sid.clone()));
                     false
-                } else if p_b == peer_id {
-                    to_notify.push((p_a.clone(), sid.clone()));
+                } else if pair.host_id == peer_id {
+                    to_close.push((pair.client_tx.clone(), sid.clone()));
                     false
                 } else {
                     true
@@ -96,35 +104,90 @@ impl PeerRegistry {
             });
         }
 
-        for (counterpart, sid) in to_notify {
-            let _ = self
-                .route_message(&counterpart, SignalingMessage::RelayClose { session_id: sid })
-                .await;
+        for (tx, sid) in to_close {
+            let _ = tx.send(SignalingMessage::RelayClose { session_id: sid });
         }
     }
 
-    pub async fn register_relay_session(&self, session_id: String, peer_a: String, peer_b: String) {
-        let mut sessions = self.relay_sessions.write().await;
-        sessions.insert(session_id, (peer_a, peer_b));
+    pub async fn get_peer_tx(&self, peer_id: &str) -> Option<mpsc::UnboundedSender<SignalingMessage>> {
+        let map = self.peers.read().await;
+        map.get(peer_id).map(|cp| cp.tx.clone())
     }
 
-    pub async fn get_relay_counterpart(&self, session_id: &str, sender_id: Option<&str>) -> Option<String> {
+    pub async fn register_relay_pair(
+        &self,
+        session_id: String,
+        client_id: String,
+        client_tx: mpsc::UnboundedSender<SignalingMessage>,
+        host_id: String,
+        host_tx: mpsc::UnboundedSender<SignalingMessage>,
+    ) {
+        let mut sessions = self.relay_sessions.write().await;
+        sessions.insert(
+            session_id,
+            RelayPair {
+                client_tx,
+                host_tx,
+                client_id,
+                host_id,
+            },
+        );
+    }
+
+    pub async fn forward_relay_data(
+        &self,
+        session_id: &str,
+        sender_tx: &mpsc::UnboundedSender<SignalingMessage>,
+        chunk: Vec<u8>,
+    ) -> bool {
         let sessions = self.relay_sessions.read().await;
-        let (p_a, p_b) = sessions.get(session_id)?;
-        if let Some(sender) = sender_id {
-            if sender == p_a {
-                Some(p_b.clone())
+        if let Some(pair) = sessions.get(session_id) {
+            let msg = SignalingMessage::RelayData {
+                session_id: session_id.to_string(),
+                chunk,
+            };
+            if sender_tx.same_channel(&pair.client_tx) {
+                pair.host_tx.send(msg).is_ok()
             } else {
-                Some(p_a.clone())
+                pair.client_tx.send(msg).is_ok()
             }
         } else {
-            Some(p_a.clone())
+            false
         }
     }
 
-    pub async fn remove_relay_session(&self, session_id: &str) -> Option<(String, String)> {
+    pub async fn forward_relay_accepted(
+        &self,
+        session_id: &str,
+    ) -> bool {
+        let sessions = self.relay_sessions.read().await;
+        if let Some(pair) = sessions.get(session_id) {
+            pair.client_tx
+                .send(SignalingMessage::RelayAccepted {
+                    session_id: session_id.to_string(),
+                })
+                .is_ok()
+        } else {
+            false
+        }
+    }
+
+    pub async fn close_relay_session(
+        &self,
+        session_id: &str,
+        sender_tx: &mpsc::UnboundedSender<SignalingMessage>,
+    ) {
         let mut sessions = self.relay_sessions.write().await;
-        sessions.remove(session_id)
+        if let Some(pair) = sessions.remove(session_id) {
+            let msg = SignalingMessage::RelayClose {
+                session_id: session_id.to_string(),
+            };
+            if sender_tx.same_channel(&pair.client_tx) {
+                let _ = pair.host_tx.send(msg);
+            } else {
+                let _ = pair.client_tx.send(msg);
+            }
+        }
     }
 
     pub async fn find_host(&self, connect_code: &str) -> Option<Peer> {

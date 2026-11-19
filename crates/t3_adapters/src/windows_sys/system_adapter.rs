@@ -36,6 +36,11 @@ impl WindowsSystemPort for WindowsSystemAdapter {
     async fn mount_drive(&self, letter: char, unc_path: &str) -> DomainResult<()> {
         let drive_spec = format!("{}:", letter.to_ascii_uppercase());
 
+        // First clean up any existing disconnected or ghost drive mapping:
+        let _ = Self::hidden_command("net")
+            .args(["use", &drive_spec, "/delete", "/y"])
+            .output();
+
         // Run: net use Z: \\10.99.0.1\Share /persistent:no
         let output = Self::hidden_command("net")
             .args(["use", &drive_spec, unc_path, "/persistent:no"])

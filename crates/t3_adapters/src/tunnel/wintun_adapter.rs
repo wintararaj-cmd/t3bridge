@@ -153,6 +153,19 @@ impl TunnelPort for WintunTunnelAdapter {
             ])
             .output();
 
+        // Configure network connection profile to Private so Windows enables File & Printer Sharing (SMB)
+        let mut ps_cmd = Command::new("powershell");
+        #[cfg(windows)]
+        ps_cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = ps_cmd
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Set-NetConnectionProfile -InterfaceAlias 't3Bridge' -NetworkCategory Private -ErrorAction SilentlyContinue",
+            ])
+            .output();
+
         let session = adapter.start_session(wintun::MAX_RING_CAPACITY).map_err(|e| {
             DomainError::NetworkFailure(format!("Failed to start Wintun session: {}", e))
         })?;

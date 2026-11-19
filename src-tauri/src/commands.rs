@@ -19,6 +19,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 pub struct AppState {
     pub hwid_provider: Arc<dyn HardwareFingerprintPort>,
     pub verifier: Arc<dyn LicenseVerifierPort>,
@@ -265,8 +268,26 @@ pub async fn connect_bridge(
                 )
             })?;
 
-            // Start client Wintun adapter FIRST (10.99.0.2) before trying to mount SMB
-            let client_vip = VirtualIp::new("10.99.0.2", 24).map_err(|e| e.to_string())?;
+            // Register client as a node so signaling server tracks this connection and assigns virtual IP
+            let hwid = state
+                .hwid_provider
+                .get_hardware_id()
+                .await
+                .map(|h| h.to_string())
+                .unwrap_or_else(|_| "CLIENT_HWID".to_string());
+            let client_node_id = format!("CLIENT-{}", &hwid[..8.min(hwid.len())]);
+
+            let reg_msg = SignalingMessage::RegisterNode {
+                peer_id: client_node_id.clone(),
+                role: PeerRole::ClientNode,
+                hardware_id: hwid,
+                license_key: "T3-CLIENT-ACTIVE".into(),
+            };
+            let client_vip = client.register_node(reg_msg).await.map_err(|e| {
+                format!("Failed to register node with signaling server: {}", e)
+            })?;
+
+            // Start client Wintun adapter with assigned virtual IP (e.g. 10.99.0.2)
             state.tunnel.start_adapter(client_vip).await.map_err(|e| {
                 format!("Failed to start virtual network adapter: {}\nMake sure t3Bridge is running as Administrator.", e)
             })?;
@@ -391,7 +412,17 @@ pub async fn start_host_mode(
     // 1. Configure Windows Firewall rule for SMB
     let _ = state.system.configure_firewall_rule("10.99.0.0/24").await;
 
-    // 2. Start server Wintun adapter with 10.99.0.1
+    // 2. Ensure C:\SharedData exists and is shared as SharedData so SMB mounts succeed
+    let shared_folder = PathBuf::from(r"C:\SharedData");
+    let _ = std::fs::create_dir_all(&shared_folder);
+    let mut cmd = std::process::Command::new("net");
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    let _ = cmd
+        .args(["share", "SharedData=C:\\SharedData", "/grant:Everyone,FULL", "/y"])
+        .output();
+
+    // 3. Start server Wintun adapter with 10.99.0.1
     let _ = state.tunnel.start_adapter(VirtualIp::new("10.99.0.1", 24).unwrap()).await;
 
     // 3. Setup WAN Relay message pump

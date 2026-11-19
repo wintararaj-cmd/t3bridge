@@ -88,12 +88,24 @@ impl ConnectToHostUseCase {
         let share_name = app_profile.default_share_name.trim_matches('\\').trim_matches('/');
         let unc_path = format!(r"\\{}\{}", smb_host, share_name);
 
-        // 6. Mount the network drive to Windows OS (e.g. Z: -> \\192.168.1.100\SharedData)
-        //    WAN relay: wait a moment for the tunnel to be ready before mounting SMB
+        // 6. Mount the network drive to Windows OS (e.g. Z: -> \\10.99.0.1\SharedData)
+        //    WAN relay: wait a moment for the tunnel to establish TCP/SMB routing, with retry
         if is_wan_relay {
             tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
         }
-        if let Err(e) = self.system.mount_drive(drive_letter, &unc_path).await {
+
+        let mut mount_res = self.system.mount_drive(drive_letter, &unc_path).await;
+        if is_wan_relay && mount_res.is_err() {
+            for _ in 1..=4 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                mount_res = self.system.mount_drive(drive_letter, &unc_path).await;
+                if mount_res.is_ok() {
+                    break;
+                }
+            }
+        }
+
+        if let Err(e) = mount_res {
             // Rollback tunnel if drive mounting fails
             if !is_wan_relay {
                 let _ = self.tunnel.disconnect().await;
