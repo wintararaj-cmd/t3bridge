@@ -30,6 +30,8 @@ impl Default for WebSocketSignalingClient {
 #[async_trait]
 impl SignalingPort for WebSocketSignalingClient {
     async fn connect(&self, signaling_url: &str) -> DomainResult<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let (ws_stream, _) = connect_async(signaling_url)
             .await
             .map_err(|e| DomainError::NetworkFailure(format!("Signaling connect error: {}", e)))?;

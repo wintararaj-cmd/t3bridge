@@ -509,3 +509,22 @@ if (toggleHostMode) {
 renderProfiles();
 loadHwid();
 loadLicenseStatus();
+loadHostStatus();
+
+async function loadHostStatus() {
+  try {
+    const status = await invoke('get_host_status');
+    if (toggleHostMode && hostStatusBadge) {
+      toggleHostMode.checked = status.is_hosting;
+      if (status.is_hosting) {
+        hostStatusBadge.textContent = "● " + status.message + " (" + status.host_code + ")";
+        hostStatusBadge.className = "badge-success";
+      } else {
+        hostStatusBadge.textContent = "Offline (Toggle to Start)";
+        hostStatusBadge.className = "badge-secondary";
+      }
+    }
+  } catch (err) {
+    console.error("loadHostStatus error:", err);
+  }
+}
