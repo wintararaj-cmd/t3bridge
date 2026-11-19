@@ -39,18 +39,26 @@ impl ConnectToHostUseCase {
         let machine = ConnectionMachine::new().mark_licensed(license_id.to_string());
 
         // 3. Start Wintun adapter and peer-to-peer tunnel
+        //    WAN mode: peer_id == "10.99.0.1" means adapter was already started in commands.rs
+        //              with client IP 10.99.0.2 before calling this use case. Skip start_adapter.
+        //    LAN mode: start adapter with the peer's IP (direct LAN connection).
         let remote_endpoint = target_peer
             .public_endpoint
             .as_deref()
             .unwrap_or("0.0.0.0:0");
 
-        self.tunnel
-            .start_adapter(target_peer.virtual_ip.clone())
-            .await?;
+        let is_wan_relay = target_peer.name == "WAN Relay Server";
+        if !is_wan_relay {
+            self.tunnel
+                .start_adapter(target_peer.virtual_ip.clone())
+                .await?;
+        }
 
         if let Err(e) = self.tunnel.connect_peer(target_peer, remote_endpoint).await {
-            // Rollback adapter if connection fails
-            let _ = self.tunnel.disconnect().await;
+            // Rollback adapter if connection fails (only if we started it)
+            if !is_wan_relay {
+                let _ = self.tunnel.disconnect().await;
+            }
             return Err(e);
         }
 
@@ -81,9 +89,15 @@ impl ConnectToHostUseCase {
         let unc_path = format!(r"\\{}\{}", smb_host, share_name);
 
         // 6. Mount the network drive to Windows OS (e.g. Z: -> \\192.168.1.100\SharedData)
+        //    WAN relay: wait a moment for the tunnel to be ready before mounting SMB
+        if is_wan_relay {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+        }
         if let Err(e) = self.system.mount_drive(drive_letter, &unc_path).await {
             // Rollback tunnel if drive mounting fails
-            let _ = self.tunnel.disconnect().await;
+            if !is_wan_relay {
+                let _ = self.tunnel.disconnect().await;
+            }
             return Err(e);
         }
 

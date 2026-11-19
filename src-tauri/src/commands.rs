@@ -216,6 +216,7 @@ pub async fn connect_bridge(
     // Case 2: LAN hostname (e.g. "SERVER-PC")
     // Case 3: Connect Code via Cloud Signaling Rendezvous Server (e.g. "OFFICE-HQ-01")
     let target_peer = if let Ok(ip) = host_input.parse::<std::net::Ipv4Addr>() {
+        // Case 1: Direct LAN IP - use it directly for SMB mount
         let virtual_ip = VirtualIp::new(&ip.to_string(), 24).map_err(|e| e.to_string())?;
         Peer::new(
             host_input.to_string(),
@@ -239,6 +240,7 @@ pub async fn connect_bridge(
             });
 
         if let Some(lan_ip) = resolved {
+            // Case 2: LAN hostname - resolved to IP, use hostname for SMB (NetBIOS/DNS)
             let virtual_ip = VirtualIp::new(&lan_ip, 24).map_err(|e| e.to_string())?;
             Peer::new(
                 host_input.to_string(),
@@ -247,7 +249,7 @@ pub async fn connect_bridge(
                 virtual_ip,
             )
         } else {
-            // Case 3: Connect Code via Cloud Signaling Rendezvous Server (Render)
+            // Case 3: Connect Code via Cloud Signaling Rendezvous Server (WAN mode)
             let client = Arc::new(WebSocketSignalingClient::new());
             client.connect(&active_signaling).await.map_err(|e| {
                 format!(
@@ -256,19 +258,28 @@ pub async fn connect_bridge(
                 )
             })?;
 
-            let found_host = client.find_host(host_input).await.map_err(|_| {
+            let _found_host = client.find_host(host_input).await.map_err(|_| {
                 format!(
                     "Host with code '{}' is not online!\n\nTo connect via code:\n1. Open t3Bridge on the Office Server computer.\n2. Go to the 'Host / Office Server' tab.\n3. Turn ON 'Accept Inbound Branch Connections'.",
                     host_input
                 )
             })?;
 
-            // Setup WAN Relay over WebSocket
+            // Start client Wintun adapter FIRST (10.99.0.2) before trying to mount SMB
+            let client_vip = VirtualIp::new("10.99.0.2", 24).map_err(|e| e.to_string())?;
+            state.tunnel.start_adapter(client_vip).await.map_err(|e| {
+                format!("Failed to start virtual network adapter: {}\nMake sure t3Bridge is running as Administrator.", e)
+            })?;
+
+            // Send RelayRequest to signaling server
             let session_id = format!("sess_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
             let _ = client.send_message(SignalingMessage::RelayRequest {
                 target_peer_id: host_input.to_string(),
                 session_id: session_id.clone(),
             }).await;
+
+            // Wait briefly for RelayAccepted before starting pump
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
             let inbound_rx = client.take_inbound_receiver().await;
             let tunnel_for_client = Arc::clone(&state.tunnel);
@@ -279,7 +290,7 @@ pub async fn connect_bridge(
                 tunnel_for_client.set_outbound_channel(out_tx);
                 let sess_clone = session_id.clone();
 
-                // Pump outbound packets from client Wintun to server via RelayData
+                // Pump outbound packets: client Wintun → RelayData → signaling server → host
                 tokio::spawn(async move {
                     while let Some(packet) = out_rx.recv().await {
                         let _ = tx.send(SignalingMessage::RelayData {
@@ -289,7 +300,7 @@ pub async fn connect_bridge(
                     }
                 });
 
-                // Pump inbound RelayData from server to client Wintun
+                // Pump inbound packets: signaling server → inject into client Wintun
                 tokio::spawn(async move {
                     while let Some(msg) = rx.recv().await {
                         match msg {
@@ -307,7 +318,15 @@ pub async fn connect_bridge(
 
             *state.client_signaling.lock().await = Some(Arc::clone(&client));
 
-            found_host
+            // Return host peer with virtual IP 10.99.0.1 (server side of tunnel)
+            // The Wintun adapter is already started; skip start_adapter in ConnectToHostUseCase
+            let server_vip = VirtualIp::new("10.99.0.1", 24).map_err(|e| e.to_string())?;
+            Peer::new(
+                "10.99.0.1".into(),         // peer_id = IP so Case A logic in connect_host.rs uses it directly
+                "WAN Relay Server".into(),
+                PeerRole::HostServer,
+                server_vip,
+            )
         }
     };
 
