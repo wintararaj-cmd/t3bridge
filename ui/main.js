@@ -469,6 +469,11 @@ setInterval(async () => {
   } catch (err) {
     // Ignore offline poll errors
   }
+  try {
+    await loadHostStatus();
+  } catch (err) {
+    // Ignore host poll errors
+  }
 }, 2500);
 
 // 7. Host / Office Server Mode Handler
@@ -518,7 +523,7 @@ async function loadHostStatus() {
       toggleHostMode.checked = status.is_hosting;
       if (status.is_hosting) {
         hostStatusBadge.textContent = "● " + status.message + " (" + status.host_code + ")";
-        hostStatusBadge.className = "badge-success";
+        hostStatusBadge.className = status.message.toLowerCase().includes("broadcasting") ? "badge-success" : "badge-secondary";
       } else {
         hostStatusBadge.textContent = "Offline (Toggle to Start)";
         hostStatusBadge.className = "badge-secondary";

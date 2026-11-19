@@ -179,7 +179,7 @@ pub async fn handle_connection(mut raw_stream: TcpStream, addr: SocketAddr, regi
 
     if let Some(ref id) = registered_peer_id {
         println!("[-] Peer disconnected: {}", id);
-        registry.unregister(id).await;
+        registry.unregister(id, Some(&tx)).await;
     }
 
     pump_handle.abort();

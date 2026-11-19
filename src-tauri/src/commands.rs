@@ -35,6 +35,7 @@ pub struct AppState {
     pub client_signaling: Mutex<Option<Arc<WebSocketSignalingClient>>>,
     pub is_hosting: Mutex<bool>,
     pub host_code: Mutex<String>,
+    pub host_status_message: Mutex<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -215,10 +216,26 @@ pub async fn connect_bridge(
     };
 
     // Determine target host & peer:
-    // Case 1: Direct IPv4 on LAN (e.g. 192.168.1.50)
-    // Case 2: LAN hostname (e.g. "SERVER-PC")
-    // Case 3: Connect Code via Cloud Signaling Rendezvous Server (e.g. "OFFICE-HQ-01")
-    let target_peer = if let Ok(ip) = host_input.parse::<std::net::Ipv4Addr>() {
+    // Case 0: Self-Hosting / Local Loopback Check
+    // If this computer is currently running in Host Mode and the user inputs this host's code
+    // (e.g. "OFFICE-HQ-01") or "127.0.0.1" or "localhost", connect directly via local SMB loopback!
+    let is_hosting_now = *state.is_hosting.lock().await;
+    let my_code = state.host_code.lock().await.clone();
+    let is_self_host = is_hosting_now && (
+        host_input.eq_ignore_ascii_case(&my_code) ||
+        host_input.eq_ignore_ascii_case("127.0.0.1") ||
+        host_input.eq_ignore_ascii_case("localhost")
+    );
+
+    let target_peer = if is_self_host {
+        let virtual_ip = VirtualIp::new("127.0.0.1", 24).map_err(|e| e.to_string())?;
+        Peer::new(
+            "127.0.0.1".into(),
+            "Local Host Server (Loopback)".into(),
+            PeerRole::HostServer,
+            virtual_ip,
+        )
+    } else if let Ok(ip) = host_input.parse::<std::net::Ipv4Addr>() {
         // Case 1: Direct LAN IP - use it directly for SMB mount
         let virtual_ip = VirtualIp::new(&ip.to_string(), 24).map_err(|e| e.to_string())?;
         Peer::new(
@@ -261,10 +278,28 @@ pub async fn connect_bridge(
                 )
             })?;
 
-            let _found_host = client.find_host(host_input).await.map_err(|_| {
+            // Auto-retry up to 3 times with 1.5s delay to allow cloud rendezvous synchronization
+            let mut found_host = None;
+            let mut last_err = String::new();
+            for attempt in 1..=3 {
+                match client.find_host(host_input).await {
+                    Ok(host) => {
+                        found_host = Some(host);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        if attempt < 3 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                        }
+                    }
+                }
+            }
+
+            let _found_host = found_host.ok_or_else(|| {
                 format!(
-                    "Host with code '{}' is not online!\n\nTo connect via code:\n1. Open t3Bridge on the Office Server computer.\n2. Go to the 'Host / Office Server' tab.\n3. Turn ON 'Accept Inbound Branch Connections'.",
-                    host_input
+                    "Host with code '{}' is not online! (Error: {})\n\nTo connect via code:\n1. Open t3Bridge on the Office Server computer.\n2. Go to the 'Host / Office Server' tab.\n3. Turn ON 'Accept Inbound Branch Connections'.",
+                    host_input, last_err
                 )
             })?;
 
@@ -476,6 +511,7 @@ pub async fn start_host_mode(
     *state.host_signaling.lock().await = Some(Arc::clone(&client));
     *state.is_hosting.lock().await = true;
     *state.host_code.lock().await = code.clone();
+    *state.host_status_message.lock().await = "Broadcasting on Cloud P2P Mesh".into();
 
     Ok(UiHostStatus {
         is_hosting: true,
@@ -493,6 +529,7 @@ pub async fn stop_host_mode(state: tauri::State<'_, AppState>) -> Result<(), Str
     }
     let _ = state.tunnel.disconnect().await;
     *state.is_hosting.lock().await = false;
+    *state.host_status_message.lock().await = "Offline".into();
     Ok(())
 }
 
@@ -500,13 +537,14 @@ pub async fn stop_host_mode(state: tauri::State<'_, AppState>) -> Result<(), Str
 pub async fn get_host_status(state: tauri::State<'_, AppState>) -> Result<UiHostStatus, String> {
     let hosting = *state.is_hosting.lock().await;
     let code = state.host_code.lock().await.clone();
+    let msg = state.host_status_message.lock().await.clone();
     Ok(UiHostStatus {
         is_hosting: hosting,
         host_code: code,
         virtual_ip: if hosting { Some("10.99.0.1".into()) } else { None },
         signaling_url: "wss://t3bridge-signaling.onrender.com".into(),
         message: if hosting {
-            "Broadcasting on Cloud P2P Mesh".into()
+            msg
         } else {
             "Offline".into()
         },
@@ -620,5 +658,6 @@ pub fn init_app_state() -> AppState {
         client_signaling: Mutex::new(None),
         is_hosting: Mutex::new(false),
         host_code: Mutex::new("OFFICE-HQ-01".into()),
+        host_status_message: Mutex::new("Offline".into()),
     }
 }

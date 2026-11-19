@@ -81,10 +81,18 @@ impl PeerRegistry {
         Ok(vip)
     }
 
-    pub async fn unregister(&self, peer_id: &str) {
+    pub async fn unregister(&self, peer_id: &str, sender_tx: Option<&mpsc::UnboundedSender<SignalingMessage>>) {
         {
             let mut map = self.peers.write().await;
-            map.remove(peer_id);
+            if let Some(expected_tx) = sender_tx {
+                if let Some(cp) = map.get(peer_id) {
+                    if cp.tx.same_channel(expected_tx) {
+                        map.remove(peer_id);
+                    }
+                }
+            } else {
+                map.remove(peer_id);
+            }
         }
 
         // Notify and clean up any relay sessions involving this peer
@@ -265,7 +273,7 @@ mod tests {
         }
 
         // Unregister
-        registry.unregister("BRANCH-01").await;
+        registry.unregister("BRANCH-01", None).await;
         assert_eq!(registry.count().await, 1);
     }
 }

@@ -38,6 +38,15 @@ impl WebSocketSignalingClient {
     pub async fn get_sender(&self) -> Option<mpsc::UnboundedSender<SignalingMessage>> {
         self.tx.lock().await.clone()
     }
+
+    pub async fn is_connected(&self) -> bool {
+        let guard = self.tx.lock().await;
+        if let Some(tx) = guard.as_ref() {
+            !tx.is_closed()
+        } else {
+            false
+        }
+    }
 }
 
 impl Default for WebSocketSignalingClient {
@@ -74,9 +83,28 @@ impl SignalingPort for WebSocketSignalingClient {
         tokio::spawn(async move {
             while let Some(Ok(Message::Text(text))) = ws_receiver.next().await {
                 if let Ok(msg) = serde_json::from_str::<SignalingMessage>(&text) {
+                    // Consume keepalive pong frames so they do not disrupt request/response channels
+                    if matches!(msg, SignalingMessage::Pong { .. }) {
+                        continue;
+                    }
                     if inbound_tx.send(msg).is_err() {
                         break;
                     }
+                }
+            }
+        });
+
+        // Background Keepalive Ping every 20 seconds to prevent Render / Cloudflare idle timeouts
+        let ping_tx = outbound_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
+            interval.tick().await; // Initial tick completes immediately
+            loop {
+                interval.tick().await;
+                if ping_tx.send(SignalingMessage::Ping {
+                    peer_id: "keepalive".into(),
+                }).is_err() {
+                    break;
                 }
             }
         });
