@@ -14,16 +14,28 @@ pub async fn handle_connection(mut raw_stream: TcpStream, addr: SocketAddr, regi
     let n = raw_stream.peek(&mut peek_buf).await.unwrap_or(0);
     let peek_str = String::from_utf8_lossy(&peek_buf[..n]);
 
-    if peek_str.starts_with("GET ") && !peek_str.to_lowercase().contains("upgrade: websocket") {
+    let is_ws_upgrade = peek_str.to_lowercase().contains("upgrade: websocket");
+
+    if !is_ws_upgrade {
         let body = "{\"status\":\"ok\",\"service\":\"t3Bridge Cloud Signaling Rendezvous Server\"}\n";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let _ = raw_stream.write_all(response.as_bytes()).await;
-        let _ = raw_stream.flush().await;
-        return;
+        if peek_str.starts_with("HEAD ") {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = raw_stream.write_all(response.as_bytes()).await;
+            let _ = raw_stream.flush().await;
+            return;
+        } else if peek_str.starts_with("GET ") || peek_str.starts_with("OPTIONS ") {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = raw_stream.write_all(response.as_bytes()).await;
+            let _ = raw_stream.flush().await;
+            return;
+        }
     }
 
     let ws_stream = match tokio_tungstenite::accept_async(raw_stream).await {
