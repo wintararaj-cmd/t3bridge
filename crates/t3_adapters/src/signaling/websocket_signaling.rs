@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use t3_application::ports::SignalingPort;
-use t3_domain::{DomainError, DomainResult, HolePunchPayload, SignalingMessage, VirtualIp};
+use t3_domain::{DomainError, DomainResult, HolePunchPayload, Peer, SignalingMessage, VirtualIp};
 
 pub struct WebSocketSignalingClient {
     tx: Arc<Mutex<Option<mpsc::UnboundedSender<SignalingMessage>>>>,
@@ -96,6 +96,39 @@ impl SignalingPort for WebSocketSignalingClient {
                 Err(DomainError::NetworkFailure(format!("Registration rejected [{code}]: {message}")))
             }
             _ => Err(DomainError::NetworkFailure("Unexpected response during registration".into())),
+        }
+    }
+
+    async fn find_host(&self, connect_code: &str) -> DomainResult<Peer> {
+        let tx = {
+            let guard = self.tx.lock().await;
+            guard
+                .clone()
+                .ok_or_else(|| DomainError::NetworkFailure("Not connected to signaling".into()))?
+        };
+
+        tx.send(SignalingMessage::FindHost {
+            connect_code: connect_code.to_string(),
+        })
+        .map_err(|e| DomainError::NetworkFailure(format!("Send find_host error: {}", e)))?;
+
+        let mut rx_guard = self.inbound_rx.lock().await;
+        let rx = rx_guard
+            .as_mut()
+            .ok_or_else(|| DomainError::NetworkFailure("No receiver configured".into()))?;
+
+        let timeout = tokio::time::Duration::from_secs(10);
+        let resp = tokio::time::timeout(timeout, rx.recv())
+            .await
+            .map_err(|_| DomainError::Timeout(format!("Finding host '{}' timed out", connect_code)))?
+            .ok_or_else(|| DomainError::NetworkFailure("Connection closed while finding host".into()))?;
+
+        match resp {
+            SignalingMessage::HostFound { host_peer } => Ok(host_peer),
+            SignalingMessage::Error { code, message } => {
+                Err(DomainError::NetworkFailure(format!("[{code}]: {message}")))
+            }
+            _ => Err(DomainError::NetworkFailure("Unexpected response while finding host".into())),
         }
     }
 

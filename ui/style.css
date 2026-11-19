@@ -615,6 +615,16 @@ input:checked + .slider:before {
   font-weight: 600;
 }
 
+.badge-secondary {
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+.badge-danger {
+  color: #ef4444;
+  font-weight: 600;
+}
+
 .alert-box {
   margin-top: 12px;
   padding: 10px 14px;

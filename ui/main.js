@@ -471,6 +471,40 @@ setInterval(async () => {
   }
 }, 2500);
 
+// 7. Host / Office Server Mode Handler
+const toggleHostMode = document.getElementById('toggleHostMode');
+const hostConnectCodeInput = document.getElementById('hostConnectCodeInput');
+const hostStatusBadge = document.getElementById('hostStatusBadge');
+
+if (toggleHostMode) {
+  toggleHostMode.addEventListener('change', async () => {
+    if (toggleHostMode.checked) {
+      const code = hostConnectCodeInput ? hostConnectCodeInput.value.trim().toUpperCase() : "OFFICE-HQ-01";
+      const signalingUrl = signalingServerUrl ? signalingServerUrl.value.trim() : null;
+      try {
+        hostStatusBadge.textContent = "Connecting to Cloud Mesh...";
+        hostStatusBadge.className = "badge-secondary";
+        const res = await invoke('start_host_mode', { connectCode: code, signalingUrl: signalingUrl });
+        hostStatusBadge.textContent = "● Broadcasting on Cloud Mesh (" + res.host_code + ")";
+        hostStatusBadge.className = "badge-success";
+      } catch (err) {
+        toggleHostMode.checked = false;
+        hostStatusBadge.textContent = "Offline (Error)";
+        hostStatusBadge.className = "badge-danger";
+        alert("Failed to start Host Server Mode: " + err);
+      }
+    } else {
+      try {
+        await invoke('stop_host_mode');
+        hostStatusBadge.textContent = "Offline (Toggle to Start)";
+        hostStatusBadge.className = "badge-secondary";
+      } catch (err) {
+        console.error(err);
+      }
+    }
+  });
+}
+
 // Initialize on page load
 renderProfiles();
 loadHwid();

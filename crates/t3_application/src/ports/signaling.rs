@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use t3_domain::{DomainResult, HolePunchPayload, SignalingMessage, VirtualIp};
+use t3_domain::{DomainResult, HolePunchPayload, Peer, SignalingMessage, VirtualIp};
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -9,6 +9,9 @@ pub trait SignalingPort: Send + Sync {
 
     /// Registers the node and gets assigned its virtual IP lease
     async fn register_node(&self, register_msg: SignalingMessage) -> DomainResult<VirtualIp>;
+
+    /// Finds an active host peer registered on the signaling rendezvous server
+    async fn find_host(&self, connect_code: &str) -> DomainResult<Peer>;
 
     /// Transmits hole-punch offer to the target peer via signaling relay
     async fn send_hole_punch_offer(&self, target_peer_id: &str, offer: HolePunchPayload) -> DomainResult<()>;

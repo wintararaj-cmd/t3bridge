@@ -47,7 +47,10 @@ fn main() {
             get_app_profiles,
             connect_bridge,
             disconnect_bridge,
-            get_session_status
+            get_session_status,
+            start_host_mode,
+            stop_host_mode,
+            get_host_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running t3Bridge application");

@@ -278,7 +278,7 @@
               <div class="sub-text">Allows remote laptops and branches to bridge with this machine.</div>
             </div>
             <label class="switch">
-              <input type="checkbox" id="toggleHostMode" checked />
+              <input type="checkbox" id="toggleHostMode" />
               <span class="slider"></span>
             </label>
           </div>
@@ -286,7 +286,7 @@
           <div class="share-info-box">
             <div class="info-item">
               <span class="info-label">Your Connect Code:</span>
-              <strong class="info-code" id="hostConnectCode">OFFICE-HQ-01</strong>
+              <input type="text" id="hostConnectCodeInput" class="input-control" value="OFFICE-HQ-01" style="width: 170px; display: inline-block; font-weight: 700; text-transform: uppercase;" />
             </div>
             <div class="info-item">
               <span class="info-label">Cloud Signaling Server:</span>
@@ -294,11 +294,11 @@
             </div>
             <div class="info-item">
               <span class="info-label">Active Virtual Subnet:</span>
-              <span>10.99.0.1/24</span>
+              <span id="hostVirtualSubnet">10.99.0.1/24</span>
             </div>
             <div class="info-item">
               <span class="info-label">Status:</span>
-              <span class="badge-success">Broadcasting on Cloud P2P Mesh</span>
+              <span id="hostStatusBadge" class="badge-secondary">Offline (Toggle to Start)</span>
             </div>
           </div>
 

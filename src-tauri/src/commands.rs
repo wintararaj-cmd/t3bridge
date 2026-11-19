@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use t3_adapters::{
-    Ed25519LicenseVerifier, FileLicenseStorage, WindowsHardwareFingerprint, WindowsSystemAdapter,
+    Ed25519LicenseVerifier, FileLicenseStorage, WebSocketSignalingClient, WindowsHardwareFingerprint,
+    WindowsSystemAdapter,
 };
 use t3_application::ports::{
-    HardwareFingerprintPort, LicenseStoragePort, LicenseVerifierPort, TunnelPort, WindowsSystemPort,
+    HardwareFingerprintPort, LicenseStoragePort, LicenseVerifierPort, SignalingPort, TunnelPort,
+    WindowsSystemPort,
 };
 use t3_application::usecases::{
     ActivateLicenseUseCase, CheckLicenseStatusUseCase, ConnectToHostUseCase,
@@ -11,7 +13,7 @@ use t3_application::usecases::{
 };
 use t3_domain::{
     AppProfile, ConnectionHealth, DomainResult, License, LicenseStatus, Peer, PeerRole,
-    TunnelMetrics, VirtualIp,
+    SignalingMessage, TunnelMetrics, VirtualIp,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -51,6 +53,18 @@ pub struct AppState {
     pub active_drive: Mutex<Option<char>>,
     pub is_connected: Mutex<bool>,
     pub active_unc: Mutex<Option<String>>,
+    pub host_signaling: Mutex<Option<Arc<WebSocketSignalingClient>>>,
+    pub is_hosting: Mutex<bool>,
+    pub host_code: Mutex<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UiHostStatus {
+    pub is_hosting: bool,
+    pub host_code: String,
+    pub virtual_ip: Option<String>,
+    pub signaling_url: String,
+    pub message: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -183,7 +197,10 @@ pub async fn connect_bridge(
     signaling_url: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    let _active_signaling = signaling_url.unwrap_or_else(|| "wss://t3bridge-signaling.onrender.com".to_string());
+    let active_signaling = signaling_url
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "wss://t3bridge-signaling.onrender.com".to_string());
+
     // 1. Enforce 7-Day Free Trial / Commercial License check
     let license_check = CheckLicenseStatusUseCase::new(
         Arc::clone(&state.hwid_provider),
@@ -199,7 +216,7 @@ pub async fn connect_bridge(
 
     let host_input = target_peer_id.trim();
     if host_input.is_empty() {
-        return Err("Please enter the Server IP or Hostname (e.g. 192.168.1.100 or SERVER-PC).".into());
+        return Err("Please enter the Server IP or Connect Code (e.g. 192.168.1.100 or OFFICE-HQ-01).".into());
     }
 
     let letter = drive_letter
@@ -218,9 +235,18 @@ pub async fn connect_bridge(
             .unwrap_or_else(AppProfile::primary_erp)
     };
 
-    // Determine target IP: direct IPv4 or resolve hostname on LAN
-    let target_ip = if let Ok(ip) = host_input.parse::<std::net::Ipv4Addr>() {
-        ip.to_string()
+    // Determine target host & peer:
+    // Case 1: Direct IPv4 on LAN (e.g. 192.168.1.50)
+    // Case 2: LAN hostname (e.g. "SERVER-PC")
+    // Case 3: Connect Code via Cloud Signaling Rendezvous Server (e.g. "OFFICE-HQ-01")
+    let target_peer = if let Ok(ip) = host_input.parse::<std::net::Ipv4Addr>() {
+        let virtual_ip = VirtualIp::new(&ip.to_string(), 24).map_err(|e| e.to_string())?;
+        Peer::new(
+            host_input.to_string(),
+            "LAN Server".into(),
+            PeerRole::HostServer,
+            virtual_ip,
+        )
     } else {
         use std::net::ToSocketAddrs;
         let resolved = format!("{}:445", host_input)
@@ -236,16 +262,34 @@ pub async fn connect_bridge(
                 })
             });
 
-        resolved.unwrap_or_else(|| "10.99.0.1".to_string())
-    };
+        if let Some(lan_ip) = resolved {
+            let virtual_ip = VirtualIp::new(&lan_ip, 24).map_err(|e| e.to_string())?;
+            Peer::new(
+                host_input.to_string(),
+                "LAN Host".into(),
+                PeerRole::HostServer,
+                virtual_ip,
+            )
+        } else {
+            // Case 3: Connect Code via Cloud Signaling Rendezvous Server (Render)
+            let client = WebSocketSignalingClient::new();
+            client.connect(&active_signaling).await.map_err(|e| {
+                format!(
+                    "Cannot reach Cloud Signaling Server ({}): {}\nPlease check your internet connection.",
+                    active_signaling, e
+                )
+            })?;
 
-    let virtual_ip = VirtualIp::new(&target_ip, 24).map_err(|e| e.to_string())?;
-    let dummy_peer = Peer::new(
-        target_peer_id,
-        "Office Server".into(),
-        PeerRole::HostServer,
-        virtual_ip,
-    );
+            let found_host = client.find_host(host_input).await.map_err(|_| {
+                format!(
+                    "Host with code '{}' is not online!\n\nTo connect via code:\n1. Open t3Bridge on the Office Server computer.\n2. Go to the 'Host / Office Server' tab.\n3. Turn ON 'Accept Inbound Branch Connections'.",
+                    host_input
+                )
+            })?;
+
+            found_host
+        }
+    };
 
     let usecase = ConnectToHostUseCase::new(
         Arc::clone(&state.tunnel),
@@ -253,7 +297,7 @@ pub async fn connect_bridge(
     );
 
     let res = usecase
-        .execute(&dummy_peer, &selected_app, letter, "T3-LIC-ACTIVE")
+        .execute(&target_peer, &selected_app, letter, "T3-LIC-ACTIVE")
         .await
         .map_err(|e| e.to_string())?;
 
@@ -262,6 +306,89 @@ pub async fn connect_bridge(
     *state.active_unc.lock().await = Some(res.session_unc_path.clone());
 
     Ok(format!("Connected! Drive {}: mapped to {}", res.drive_letter, res.session_unc_path))
+}
+
+#[tauri::command]
+pub async fn start_host_mode(
+    connect_code: String,
+    signaling_url: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiHostStatus, String> {
+    let code = if connect_code.trim().is_empty() {
+        "OFFICE-HQ-01".to_string()
+    } else {
+        connect_code.trim().to_uppercase()
+    };
+
+    let url = signaling_url
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "wss://t3bridge-signaling.onrender.com".to_string());
+
+    let client = Arc::new(WebSocketSignalingClient::new());
+    client
+        .connect(&url)
+        .await
+        .map_err(|e| format!("Failed to connect to signaling server ({}): {}", url, e))?;
+
+    let hwid = state
+        .hwid_provider
+        .get_hardware_id()
+        .await
+        .map(|h| h.to_string())
+        .unwrap_or_else(|_| "UNKNOWN_HWID".to_string());
+
+    let reg_msg = SignalingMessage::RegisterNode {
+        peer_id: code.clone(),
+        role: PeerRole::HostServer,
+        hardware_id: hwid,
+        license_key: "T3-HOST-ACTIVE".into(),
+    };
+
+    let vip = client
+        .register_node(reg_msg)
+        .await
+        .map_err(|e| format!("Registration failed on signaling server: {}", e))?;
+
+    // Configure Windows Firewall rule for SMB
+    let _ = state.system.configure_firewall_rule("10.99.0.0/24").await;
+
+    *state.host_signaling.lock().await = Some(Arc::clone(&client));
+    *state.is_hosting.lock().await = true;
+    *state.host_code.lock().await = code.clone();
+
+    Ok(UiHostStatus {
+        is_hosting: true,
+        host_code: code,
+        virtual_ip: Some(vip.addr().to_string()),
+        signaling_url: url,
+        message: "Broadcasting on Cloud P2P Mesh".into(),
+    })
+}
+
+#[tauri::command]
+pub async fn stop_host_mode(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if let Some(client) = state.host_signaling.lock().await.take() {
+        let _ = client.disconnect().await;
+    }
+    *state.is_hosting.lock().await = false;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_host_status(state: tauri::State<'_, AppState>) -> Result<UiHostStatus, String> {
+    let hosting = *state.is_hosting.lock().await;
+    let code = state.host_code.lock().await.clone();
+    Ok(UiHostStatus {
+        is_hosting: hosting,
+        host_code: code,
+        virtual_ip: if hosting { Some("10.99.0.1".into()) } else { None },
+        signaling_url: "wss://t3bridge-signaling.onrender.com".into(),
+        message: if hosting {
+            "Broadcasting on Cloud P2P Mesh".into()
+        } else {
+            "Offline".into()
+        },
+    })
 }
 
 #[tauri::command]
@@ -363,5 +490,8 @@ pub fn init_app_state() -> AppState {
         active_drive: Mutex::new(None),
         is_connected: Mutex::new(false),
         active_unc: Mutex::new(None),
+        host_signaling: Mutex::new(None),
+        is_hosting: Mutex::new(false),
+        host_code: Mutex::new("OFFICE-HQ-01".into()),
     }
 }
