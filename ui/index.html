@@ -34,6 +34,21 @@
       <button type="button" id="btnGoToLicense" class="btn btn-secondary btn-sm">Activate</button>
     </div>
 
+    <!-- Global Version Update Notification Banner -->
+    <div id="updateBanner" style="display: none; background: linear-gradient(135deg, #1e3a8a, #0369a1); border: 1px solid #38bdf8; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 12px; color: #f0fdf4; align-items: center; justify-content: space-between; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.25);">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span style="font-size: 16px;">🚀</span>
+        <div>
+          <strong id="updateVersionTitle">New version available!</strong>
+          <div id="updateNotes" style="font-size: 11px; color: #bae6fd; margin-top: 2px;"></div>
+        </div>
+      </div>
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <button type="button" id="btnDownloadUpdate" class="btn btn-sm" style="background: #22c55e; color: #fff; padding: 5px 12px; font-size: 11px; font-weight: 700; border: none; border-radius: 6px; cursor: pointer;">Download Update</button>
+        <button type="button" id="btnDismissUpdate" style="background: none; border: none; color: #93c5fd; font-size: 18px; cursor: pointer; padding: 0 4px;">&times;</button>
+      </div>
+    </div>
+
     <!-- Navigation Tabs -->
     <nav class="nav-tabs">
       <button class="tab-btn active" data-tab="tab-connect">Connection</button>
@@ -45,47 +60,11 @@
     <main class="tab-content">
       <!-- Tab 1: Connect -->
       <section id="tab-connect" class="tab-pane active">
-        <div class="card">
-          <div class="form-group">
-            <div class="label-with-action">
-              <label for="appProfileSelect">Target Business Application / Share</label>
-              <button type="button" id="btnToggleNewProfile" class="btn-text-link">+ Add Custom Application</button>
-            </div>
-            <div class="select-with-delete">
-              <select id="appProfileSelect" class="input-control">
-                <option value="primary_erp">Primary Business ERP (Database & Share)</option>
-                <option value="branch_share">Branch Accounting & Document Share</option>
-                <option value="smb_share">General SMB Network Share</option>
-              </select>
-              <button type="button" id="btnDeleteProfile" class="btn-icon-danger" title="Remove custom profile" style="display: none;">🗑️</button>
-            </div>
-          </div>
-
-          <!-- Inline Custom Profile Creator -->
-          <div id="newProfileContainer" class="new-profile-box" style="display: none;">
-            <div class="new-profile-header">
-              <span>Add Custom Business Application</span>
-              <button type="button" id="btnCloseProfileBox" class="btn-close">&times;</button>
-            </div>
-            <div class="grid-2">
-              <div class="form-group">
-                <label for="newProfileName">Application Name</label>
-                <input type="text" id="newProfileName" class="input-control" placeholder="e.g. My Accounting ERP, Godown Share" />
-              </div>
-              <div class="form-group">
-                <label for="newProfileShare">Server Share Folder</label>
-                <input type="text" id="newProfileShare" class="input-control" placeholder="e.g. SharedData" value="SharedData" />
-              </div>
-            </div>
-            <div class="action-row" style="margin-top: 6px;">
-              <button type="button" id="btnSaveCustomProfile" class="btn btn-secondary btn-sm">Save & Select</button>
-            </div>
-          </div>
-
+        <div class="card" id="connInputCard">
           <div class="grid-2">
             <div class="form-group">
-              <label for="targetPeerId">Office Server (IP or Hostname)</label>
-              <input type="text" id="targetPeerId" class="input-control" placeholder="e.g. 192.168.1.100 or SERVER-PC" value="" />
+              <label for="targetPeerId">Office Server (IP address or Connect Code)</label>
+              <input type="text" id="targetPeerId" class="input-control" placeholder="e.g. 192.168.1.100 or OFFICE-HO-01" value="" />
             </div>
             <div class="form-group">
               <label for="driveLetter">Map Drive Letter</label>
@@ -99,8 +78,36 @@
           </div>
 
           <div class="action-row">
-            <button id="btnConnect" class="btn btn-primary">Connect Bridge</button>
+            <button id="btnConnect" class="btn btn-primary">Connect &amp; View Folders</button>
+            <button id="btnOpenFolder" class="btn btn-secondary" style="display: none; background: #2563eb; color: #fff;">📂 Open Folder</button>
             <button id="btnDisconnect" class="btn btn-danger" style="display: none;">Disconnect</button>
+          </div>
+        </div>
+
+        <!-- Discovered Shares Card (Shown after successful server connect) -->
+        <div class="card" id="sharesCard" style="display: none; border-color: #3b82f6; background: rgba(17, 24, 39, 0.95); margin-top: 14px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <div style="font-weight: 700; color: #93c5fd; font-size: 14px; display: flex; align-items: center; gap: 8px;">
+              <span>📁</span> Available Shared Folders on Server
+            </div>
+            <span id="sharesCountBadge" class="badge-success" style="font-size: 11px;">0 folders</span>
+          </div>
+          <p class="description" style="margin-bottom: 12px; font-size: 12px;">
+            Click to select the shared folder you want to map as a network drive on this PC:
+          </p>
+
+          <div id="sharesList" class="shares-list-container">
+            <!-- Dynamically populated share folder items -->
+          </div>
+
+          <!-- Fallback custom share input if needed -->
+          <div id="customShareRow" style="margin-top: 10px; display: flex; gap: 8px; align-items: center;">
+            <input type="text" id="customShareInput" class="input-control" placeholder="Or type share name manually (e.g. python, MargERP)" style="font-size: 12px;" />
+            <button type="button" id="btnUseCustomShare" class="btn btn-secondary btn-sm" style="white-space: nowrap;">Select</button>
+          </div>
+
+          <div class="action-row" style="margin-top: 14px;">
+            <button id="btnMountShare" class="btn btn-primary" disabled>Map Selected Folder to Drive Z:</button>
           </div>
         </div>
 
@@ -286,34 +293,28 @@
           <div class="share-info-box">
             <div class="info-item">
               <span class="info-label">Your Connect Code:</span>
-              <input type="text" id="hostConnectCodeInput" class="input-control" value="OFFICE-HQ-01" style="width: 170px; display: inline-block; font-weight: 700; text-transform: uppercase;" />
-            </div>
-            <div class="info-item">
-              <span class="info-label">Cloud Signaling Server:</span>
-              <span class="badge-success">wss://t3bridge-signaling.onrender.com</span>
-            </div>
-            <div class="info-item">
-              <span class="info-label">Active Virtual Subnet:</span>
-              <span id="hostVirtualSubnet">10.99.0.1/24</span>
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <input type="text" id="hostConnectCodeInput" class="input-control" value="OFFICE-HQ-01" style="width: 170px; font-weight: 700; text-transform: uppercase;" />
+                <button type="button" id="btnCopyHostCode" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;">Copy Code</button>
+              </div>
             </div>
             <div class="info-item">
               <span class="info-label">Status:</span>
               <span id="hostStatusBadge" class="badge-secondary">Offline (Toggle to Start)</span>
             </div>
             <div class="info-item">
-              <span class="info-label">Active Windows Share:</span>
-              <span class="badge-success">\\10.99.0.1\SharedData (C:\SharedData)</span>
+              <span class="info-label">Active Virtual Subnet:</span>
+              <span id="hostVirtualSubnet">10.99.0.1/24</span>
             </div>
-          </div>
-          <div class="sub-text" style="margin-top: 8px; font-size: 11px; color: #a5b4fc;">
-            💡 <strong>Share Location:</strong> Default ERP connects to <code>C:\SharedData</code>. Copy your ERP data to <code>C:\SharedData</code>, or right-click your folder &gt; Properties &gt; Sharing &gt; Share as 'SharedData'.
-          </div>
-
-          <div class="form-group" style="margin-top: 16px;">
-            <label for="signalingServerUrl">Cloud Signaling Server (Render / WAN)</label>
-            <input type="text" id="signalingServerUrl" class="input-control" value="wss://t3bridge-signaling.onrender.com" />
-            <div class="sub-text" style="margin-top: 4px; font-size: 11px; color: #94a3b8;">
-              Live cloud rendezvous endpoint for remote branch and WAN connections.
+            <div class="info-item">
+              <span class="info-label">Active Branch Nodes:</span>
+              <span id="hostActiveNodesBadge" class="badge-secondary">0 / 3 Nodes Connected</span>
+            </div>
+            <div class="info-item" style="align-items: flex-start; flex-direction: column; gap: 6px;">
+              <span class="info-label">📁 Active Shares Available to Clients:</span>
+              <div id="hostActiveSharesContainer" style="display: flex; flex-wrap: wrap; gap: 6px; width: 100%;">
+                <span class="badge-secondary">Auto-detected when host starts</span>
+              </div>
             </div>
           </div>
         </div>

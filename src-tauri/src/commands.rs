@@ -36,6 +36,12 @@ pub struct AppState {
     pub is_hosting: Mutex<bool>,
     pub host_code: Mutex<String>,
     pub host_status_message: Mutex<String>,
+    pub active_server_ip: Mutex<Option<String>>,   // server IP after tunnel is up (for share listing)
+    pub host_share_name: Mutex<String>,
+    pub host_share_path: Mutex<String>,
+    pub discovered_shares: Arc<Mutex<Vec<String>>>,
+    pub host_connected_clients: Arc<Mutex<std::collections::HashSet<String>>>,
+    pub host_max_nodes: Arc<Mutex<u32>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -45,6 +51,11 @@ pub struct UiHostStatus {
     pub virtual_ip: Option<String>,
     pub signaling_url: String,
     pub message: String,
+    pub share_name: String,
+    pub share_path: String,
+    pub detected_shares: Vec<String>,
+    pub active_nodes: u32,
+    pub max_nodes: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -57,6 +68,7 @@ pub struct UiSessionStatus {
     pub health_level: String,
     pub is_safe: bool,
     pub alert_message: Option<String>,
+    pub target_ip: Option<String>,
 }
 
 #[tauri::command]
@@ -270,6 +282,7 @@ pub async fn connect_bridge(
             )
         } else {
             // Case 3: Connect Code via Cloud Signaling Rendezvous Server (WAN mode)
+            let clean_code = host_input.to_uppercase();
             let client = Arc::new(WebSocketSignalingClient::new());
             client.connect(&active_signaling).await.map_err(|e| {
                 format!(
@@ -282,7 +295,7 @@ pub async fn connect_bridge(
             let mut found_host = None;
             let mut last_err = String::new();
             for attempt in 1..=3 {
-                match client.find_host(host_input).await {
+                match client.find_host(&clean_code).await {
                     Ok(host) => {
                         found_host = Some(host);
                         break;
@@ -299,7 +312,7 @@ pub async fn connect_bridge(
             let _found_host = found_host.ok_or_else(|| {
                 format!(
                     "Host with code '{}' is not online! (Error: {})\n\nTo connect via code:\n1. Open t3Bridge on the Office Server computer.\n2. Go to the 'Host / Office Server' tab.\n3. Turn ON 'Accept Inbound Branch Connections'.",
-                    host_input, last_err
+                    clean_code, last_err
                 )
             })?;
 
@@ -330,7 +343,7 @@ pub async fn connect_bridge(
             // Send RelayRequest to signaling server
             let session_id = format!("sess_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
             let _ = client.send_message(SignalingMessage::RelayRequest {
-                target_peer_id: host_input.to_string(),
+                target_peer_id: clean_code.clone(),
                 session_id: session_id.clone(),
             }).await;
 
@@ -403,10 +416,254 @@ pub async fn connect_bridge(
     Ok(format!("Connected! Drive {}: mapped to {}", res.drive_letter, res.session_unc_path))
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Two-Phase Connect: Phase 1 — establish tunnel only, return server IP
+// ─────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+pub struct PeerConnectionInfo {
+    pub server_ip: String,   // IP to query shares from (virtual or real LAN IP)
+    pub is_wan: bool,
+    pub peer_id: String,
+}
+
+#[tauri::command]
+pub async fn connect_peer_only(
+    target_peer_id: String,
+    signaling_url: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<PeerConnectionInfo, String> {
+    // License check
+    let license_check = CheckLicenseStatusUseCase::new(
+        Arc::clone(&state.hwid_provider),
+        Arc::clone(&state.storage),
+    );
+    if !license_check.execute().await.map_err(|e| e.to_string())?.is_allowed_to_connect() {
+        return Err("Trial expired. Please activate a license.".into());
+    }
+
+    let host_input = target_peer_id.trim();
+    if host_input.is_empty() {
+        return Err("Please enter Server IP or Connect Code.".into());
+    }
+
+    let active_signaling = signaling_url
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "wss://t3bridge-signaling.onrender.com".to_string());
+
+    // Reuse same peer resolution logic as connect_bridge
+    let is_hosting_now = *state.is_hosting.lock().await;
+    let my_code = state.host_code.lock().await.clone();
+    let is_self_host = is_hosting_now && (
+        host_input.eq_ignore_ascii_case(&my_code) ||
+        host_input.eq_ignore_ascii_case("127.0.0.1") ||
+        host_input.eq_ignore_ascii_case("localhost")
+    );
+
+    let (target_peer, server_ip, is_wan) = if is_self_host {
+        let vip = VirtualIp::new("127.0.0.1", 24).map_err(|e| e.to_string())?;
+        let peer = Peer::new("127.0.0.1".into(), "Local Host Server (Loopback)".into(), PeerRole::HostServer, vip);
+        (peer, "127.0.0.1".to_string(), false)
+
+    } else if let Ok(ip) = host_input.parse::<std::net::Ipv4Addr>() {
+        let vip = VirtualIp::new(&ip.to_string(), 24).map_err(|e| e.to_string())?;
+        let peer = Peer::new(host_input.to_string(), "LAN Server".into(), PeerRole::HostServer, vip);
+        (peer, ip.to_string(), false)
+
+    } else {
+        use std::net::ToSocketAddrs;
+        let resolved = format!("{}:445", host_input)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.find_map(|sa| {
+                if let std::net::SocketAddr::V4(v4) = sa { Some(v4.ip().to_string()) } else { None }
+            }));
+
+        if let Some(lan_ip) = resolved {
+            let vip = VirtualIp::new(&lan_ip, 24).map_err(|e| e.to_string())?;
+            let peer = Peer::new(host_input.to_string(), "LAN Host".into(), PeerRole::HostServer, vip);
+            (peer, host_input.to_string(), false)
+        } else {
+            // WAN: Cloud Signaling
+            let clean_code = host_input.to_uppercase();
+            let client = Arc::new(WebSocketSignalingClient::new());
+            client.connect(&active_signaling).await.map_err(|e| format!("Cannot reach signaling server: {}", e))?;
+
+            let mut found_host = None;
+            for attempt in 1..=3 {
+                match client.find_host(&clean_code).await {
+                    Ok(h) => { found_host = Some(h); break; }
+                    Err(e) => { if attempt < 3 { tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await; } else { return Err(format!("Host '{}' not online: {}", clean_code, e)); } }
+                }
+            }
+            let _ = found_host.unwrap();
+
+            let hwid = state.hwid_provider.get_hardware_id().await
+                .map(|h| h.to_string()).unwrap_or_else(|_| "CLIENT_HWID".to_string());
+            let client_node_id = format!("CLIENT-{}", &hwid[..8.min(hwid.len())]);
+
+            let reg_msg = SignalingMessage::RegisterNode {
+                peer_id: client_node_id.clone(),
+                role: PeerRole::ClientNode,
+                hardware_id: hwid,
+                license_key: "T3-CLIENT-ACTIVE".into(),
+            };
+            let client_vip = client.register_node(reg_msg).await.map_err(|e| format!("Node registration failed: {}", e))?;
+
+            state.tunnel.start_adapter(client_vip).await.map_err(|e| format!("Tunnel start failed: {}", e))?;
+
+            let session_id = format!("sess_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+            let _ = client.send_message(SignalingMessage::RelayRequest {
+                target_peer_id: clean_code.clone(),
+                session_id: session_id.clone(),
+            }).await;
+
+            // Also query server shares via HolePunchOffer (existing Render routed message)
+            let query_offer = t3_domain::HolePunchPayload {
+                peer_id: client_node_id.clone(),
+                public_endpoint: "0.0.0.0:0".into(),
+                wireguard_pubkey: "QUERY_SHARES".into(),
+                local_candidate: None,
+            };
+            let _ = client.send_message(SignalingMessage::HolePunchOffer {
+                target_peer_id: clean_code.clone(),
+                offer: query_offer,
+            }).await;
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
+
+            let inbound_rx = client.take_inbound_receiver().await;
+            let tunnel_for_client = Arc::clone(&state.tunnel);
+            let client_sender = client.get_sender().await;
+            let discovered_shares_ref = Arc::clone(&state.discovered_shares);
+
+            if let (Some(mut rx), Some(tx)) = (inbound_rx, client_sender) {
+                let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                tunnel_for_client.set_outbound_channel(out_tx);
+                let sess_clone = session_id.clone();
+                tokio::spawn(async move {
+                    while let Some(packet) = out_rx.recv().await {
+                        let _ = tx.send(SignalingMessage::RelayData { session_id: sess_clone.clone(), chunk: packet });
+                    }
+                });
+                tokio::spawn(async move {
+                    while let Some(msg) = rx.recv().await {
+                        match msg {
+                            SignalingMessage::RelayData { chunk, .. } => {
+                                let _ = tunnel_for_client.inject_inbound_packet(&chunk);
+                            }
+                            SignalingMessage::HolePunchAnswer { answer, .. } => {
+                                if answer.wireguard_pubkey.starts_with("SHARES:") {
+                                    let csv = answer.wireguard_pubkey.trim_start_matches("SHARES:");
+                                    let parsed: Vec<String> = csv
+                                        .split(',')
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty())
+                                        .collect();
+                                    *discovered_shares_ref.lock().await = parsed;
+                                }
+                            }
+                            SignalingMessage::RelayClose { .. } => break,
+                            _ => {}
+                        }
+                    }
+                });
+            }
+
+            *state.client_signaling.lock().await = Some(Arc::clone(&client));
+            let server_vip = VirtualIp::new("10.99.0.1", 24).map_err(|e| e.to_string())?;
+            let peer = Peer::new("10.99.0.1".into(), "WAN Relay Server".into(), PeerRole::HostServer, server_vip);
+            (peer, "10.99.0.1".to_string(), true)
+        }
+    };
+
+    // Store server IP for share listing
+    *state.active_server_ip.lock().await = Some(server_ip.clone());
+
+    // Connect tunnel (but don't mount drive yet)
+    let is_wan_relay = target_peer.name == "WAN Relay Server";
+    if !is_wan_relay {
+        state.tunnel.start_adapter(target_peer.virtual_ip.clone()).await
+            .map_err(|e| format!("Tunnel adapter failed: {}", e))?;
+        state.tunnel.connect_peer(&target_peer, target_peer.public_endpoint.as_deref().unwrap_or("0.0.0.0:0")).await
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(PeerConnectionInfo { server_ip, is_wan, peer_id: target_peer.peer_id.clone() })
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Two-Phase Connect: Phase 2a — List server's available SMB shares
+// ─────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_server_shares(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let server_ip = state.active_server_ip.lock().await.clone()
+        .ok_or("Not connected to any server. Connect first.")?;
+
+    let is_wan = server_ip == "10.99.0.1";
+
+    if is_wan {
+        // Wait briefly for host signaling share response
+        for _ in 0..6 {
+            let s = state.discovered_shares.lock().await.clone();
+            if !s.is_empty() {
+                return Ok(s);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    // Direct network scan via net view
+    let mut shares = state.system.list_remote_shares(&server_ip).await.unwrap_or_default();
+
+    if shares.is_empty() && is_wan {
+        // Fallback default suggestions for WAN so user can 1-click select
+        shares = vec!["python".into(), "MargERP".into(), "SharedData".into()];
+    }
+
+    Ok(shares)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Two-Phase Connect: Phase 2b — Mount the user-selected share
+// ─────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn mount_selected_share(
+    share_name: String,
+    drive_letter: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let server_ip = state.active_server_ip.lock().await.clone()
+        .ok_or("Not connected to any server.")?;
+
+    let letter = drive_letter.chars().next().unwrap_or('Z').to_ascii_uppercase();
+
+    let clean_share = share_name.trim().trim_matches('\\').trim_matches('/');
+    if clean_share.is_empty() {
+        return Err("Share name cannot be empty.".into());
+    }
+
+    let unc_path = format!(r"\\{}\{}", server_ip, clean_share);
+
+    state.system.mount_drive(letter, &unc_path).await.map_err(|e| e.to_string())?;
+
+    *state.active_drive.lock().await = Some(letter);
+    *state.is_connected.lock().await = true;
+    *state.active_unc.lock().await = Some(unc_path.clone());
+
+    Ok(format!("Drive {}: mapped to {}", letter, unc_path))
+}
+
 #[tauri::command]
 pub async fn start_host_mode(
     connect_code: String,
     signaling_url: Option<String>,
+    share_folder_path: Option<String>,
+    share_name: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<UiHostStatus, String> {
     let code = if connect_code.trim().is_empty() {
@@ -418,6 +675,21 @@ pub async fn start_host_mode(
     let url = signaling_url
         .filter(|u| !u.trim().is_empty())
         .unwrap_or_else(|| "wss://t3bridge-signaling.onrender.com".to_string());
+
+    // Resolve share path and name — accept any drive/folder
+    let resolved_share_name = share_name
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("SharedData")
+        .to_string();
+
+    let resolved_share_path = share_folder_path
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(r"C:\SharedData")
+        .to_string();
 
     let client = Arc::new(WebSocketSignalingClient::new());
     client
@@ -447,23 +719,71 @@ pub async fn start_host_mode(
     // 1. Configure Windows Firewall rule for SMB
     let _ = state.system.configure_firewall_rule("10.99.0.0/24").await;
 
-    // 2. Ensure C:\SharedData exists and is shared as SharedData so SMB mounts succeed
-    let shared_folder = PathBuf::from(r"C:\SharedData");
+    // 2. Ensure the user-specified folder exists and is shared over SMB
+    //    Supports any drive: C:\, D:\, E:\, etc.
+    let shared_folder = PathBuf::from(&resolved_share_path);
     let _ = std::fs::create_dir_all(&shared_folder);
+
+    // Remove old share with same name (if any), then re-create
+    let net_share_arg = format!("{}={}", resolved_share_name, resolved_share_path);
+    let mut del_cmd = std::process::Command::new("net");
+    #[cfg(windows)]
+    del_cmd.creation_flags(0x08000000);
+    let _ = del_cmd
+        .args(["share", &resolved_share_name, "/delete", "/y"])
+        .output();
+
     let mut cmd = std::process::Command::new("net");
     #[cfg(windows)]
     cmd.creation_flags(0x08000000);
-    let _ = cmd
-        .args(["share", "SharedData=C:\\SharedData", "/grant:Everyone,FULL", "/y"])
+    let share_result = cmd
+        .args(["share", &net_share_arg, "/grant:Everyone,FULL", "/y"])
+        .output();
+
+    if let Err(e) = share_result {
+        return Err(format!(
+            "Failed to create Windows share '{}' for path '{}': {}",
+            resolved_share_name, resolved_share_path, e
+        ));
+    }
+
+    // Set NTFS folder permissions so Everyone can read/write files over SMB
+    let mut icacls_cmd = std::process::Command::new("icacls");
+    #[cfg(windows)]
+    icacls_cmd.creation_flags(0x08000000);
+    let _ = icacls_cmd
+        .args([&resolved_share_path, "/grant", "Everyone:(OI)(CI)F", "/T", "/C", "/Q"])
         .output();
 
     // 3. Start server Wintun adapter with 10.99.0.1
-    let _ = state.tunnel.start_adapter(VirtualIp::new("10.99.0.1", 24).unwrap()).await;
+    state
+        .tunnel
+        .start_adapter(VirtualIp::new("10.99.0.1", 24).unwrap())
+        .await
+        .map_err(|e| format!("Failed to start host virtual network adapter: {}", e))?;
+
+    // Determine allowed branch nodes based on Host license (default starter pack = 3)
+    let license_usecase = CheckLicenseStatusUseCase::new(
+        Arc::clone(&state.hwid_provider),
+        Arc::clone(&state.storage),
+    );
+    let license_status = license_usecase.execute().await.unwrap_or(LicenseStatus::TrialExpired);
+    let allowed_nodes: u32 = match license_status {
+        LicenseStatus::Licensed { max_nodes, .. } => max_nodes,
+        LicenseStatus::TrialActive { .. } => 3, // 1 Host + 3 Clients starter pack
+        _ => 3,
+    };
+    *state.host_max_nodes.lock().await = allowed_nodes;
+    state.host_connected_clients.lock().await.clear();
 
     // 3. Setup WAN Relay message pump
     let inbound_rx = client.take_inbound_receiver().await;
     let tunnel_for_host = Arc::clone(&state.tunnel);
+    let system_for_host = Arc::clone(&state.system);
     let client_sender = client.get_sender().await;
+    let share_for_pump = resolved_share_name.clone();
+    let host_code_for_pump = code.clone();
+    let host_clients_for_pump = Arc::clone(&state.host_connected_clients);
 
     if let (Some(mut rx), Some(tx)) = (inbound_rx, client_sender) {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -473,6 +793,7 @@ pub async fn start_host_mode(
             let active_session = Arc::new(tokio::sync::Mutex::new(None::<String>));
             let active_sess_for_out = Arc::clone(&active_session);
             let tx_for_out = tx.clone();
+            let host_clients = host_clients_for_pump;
 
             // Pump outbound packets from server Wintun to client via RelayData
             tokio::spawn(async move {
@@ -491,15 +812,48 @@ pub async fn start_host_mode(
             while let Some(msg) = rx.recv().await {
                 match msg {
                     SignalingMessage::RelayRequest { target_peer_id: _, session_id } => {
-                        *active_session.lock().await = Some(session_id.clone());
-                        let _ = tx.send(SignalingMessage::RelayAccepted {
-                            session_id,
+                        let mut clients = host_clients.lock().await;
+                        if clients.len() as u32 >= allowed_nodes && !clients.contains(&session_id) {
+                            let _ = tx.send(SignalingMessage::Error {
+                                code: "PEER_LIMIT_EXCEEDED".into(),
+                                message: format!(
+                                    "Host connection limit reached ({}/{} branch nodes connected). Please upgrade your t3Bridge commercial license to connect more branch clients.",
+                                    clients.len(),
+                                    allowed_nodes
+                                ),
+                            });
+                        } else {
+                            clients.insert(session_id.clone());
+                            *active_session.lock().await = Some(session_id.clone());
+                            let _ = tx.send(SignalingMessage::RelayAccepted {
+                                session_id,
+                            });
+                        }
+                    }
+                    SignalingMessage::HolePunchOffer { target_peer_id: _, offer } => {
+                        // Client is requesting server share list
+                        let mut local_shares = system_for_host.list_local_shares().await.unwrap_or_default();
+                        if !share_for_pump.is_empty() && !local_shares.contains(&share_for_pump) {
+                            local_shares.insert(0, share_for_pump.clone());
+                        }
+                        let shares_csv = local_shares.join(",");
+                        let answer = t3_domain::HolePunchPayload {
+                            peer_id: host_code_for_pump.clone(),
+                            public_endpoint: "0.0.0.0:0".into(),
+                            wireguard_pubkey: format!("SHARES:{}", shares_csv),
+                            local_candidate: None,
+                        };
+                        let _ = tx.send(SignalingMessage::HolePunchAnswer {
+                            target_peer_id: offer.peer_id,
+                            answer,
                         });
                     }
-                    SignalingMessage::RelayData { session_id: _, chunk } => {
+                    SignalingMessage::RelayData { session_id, chunk } => {
+                        *active_session.lock().await = Some(session_id);
                         let _ = tunnel_for_host.inject_inbound_packet(&chunk);
                     }
-                    SignalingMessage::RelayClose { session_id: _ } => {
+                    SignalingMessage::RelayClose { session_id } => {
+                        host_clients.lock().await.remove(&session_id);
                         *active_session.lock().await = None;
                     }
                     _ => {}
@@ -508,10 +862,14 @@ pub async fn start_host_mode(
         });
     }
 
+    let detected_shares = state.system.list_local_shares().await.unwrap_or_default();
+
     *state.host_signaling.lock().await = Some(Arc::clone(&client));
     *state.is_hosting.lock().await = true;
     *state.host_code.lock().await = code.clone();
     *state.host_status_message.lock().await = "Broadcasting on Cloud P2P Mesh".into();
+    *state.host_share_name.lock().await = resolved_share_name.clone();
+    *state.host_share_path.lock().await = resolved_share_path.clone();
 
     Ok(UiHostStatus {
         is_hosting: true,
@@ -519,6 +877,11 @@ pub async fn start_host_mode(
         virtual_ip: Some(vip.addr().to_string()),
         signaling_url: url,
         message: "Broadcasting on Cloud P2P Mesh".into(),
+        share_name: resolved_share_name,
+        share_path: resolved_share_path,
+        detected_shares,
+        active_nodes: 0,
+        max_nodes: allowed_nodes,
     })
 }
 
@@ -528,6 +891,7 @@ pub async fn stop_host_mode(state: tauri::State<'_, AppState>) -> Result<(), Str
         let _ = client.disconnect().await;
     }
     let _ = state.tunnel.disconnect().await;
+    state.host_connected_clients.lock().await.clear();
     *state.is_hosting.lock().await = false;
     *state.host_status_message.lock().await = "Offline".into();
     Ok(())
@@ -538,6 +902,15 @@ pub async fn get_host_status(state: tauri::State<'_, AppState>) -> Result<UiHost
     let hosting = *state.is_hosting.lock().await;
     let code = state.host_code.lock().await.clone();
     let msg = state.host_status_message.lock().await.clone();
+    let share_name = state.host_share_name.lock().await.clone();
+    let share_path = state.host_share_path.lock().await.clone();
+    let active_nodes = state.host_connected_clients.lock().await.len() as u32;
+    let max_nodes = *state.host_max_nodes.lock().await;
+    let detected_shares = if hosting {
+        state.system.list_local_shares().await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     Ok(UiHostStatus {
         is_hosting: hosting,
         host_code: code,
@@ -548,6 +921,11 @@ pub async fn get_host_status(state: tauri::State<'_, AppState>) -> Result<UiHost
         } else {
             "Offline".into()
         },
+        share_name: if hosting { share_name } else { String::new() },
+        share_path: if hosting { share_path } else { String::new() },
+        detected_shares,
+        active_nodes,
+        max_nodes,
     })
 }
 
@@ -568,6 +946,7 @@ pub async fn disconnect_bridge(state: tauri::State<'_, AppState>) -> Result<(), 
     *state.active_drive.lock().await = None;
     *state.is_connected.lock().await = false;
     *state.active_unc.lock().await = None;
+    *state.active_server_ip.lock().await = None;
 
     Ok(())
 }
@@ -594,6 +973,7 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
             }
         });
 
+        let target_ip = state.active_server_ip.lock().await.clone();
         let health_level = format!("{:?}", report.health);
 
         Ok(UiSessionStatus {
@@ -611,6 +991,7 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
             health_level,
             is_safe: report.is_safe,
             alert_message: report.recommendation,
+            target_ip,
         })
     } else {
         Ok(UiSessionStatus {
@@ -622,8 +1003,35 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
             health_level: "Dead".into(),
             is_safe: true,
             alert_message: None,
+            target_ip: None,
         })
     }
+}
+
+#[tauri::command]
+pub async fn open_folder(
+    drive_letter: Option<char>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let drive = drive_letter
+        .or(*state.active_drive.lock().await)
+        .unwrap_or('Z');
+    let unc = state.active_unc.lock().await.clone();
+
+    let path_to_open = format!(r"{}:\", drive);
+
+    let target = if std::path::Path::new(&path_to_open).exists() {
+        path_to_open
+    } else if let Some(unc_path) = unc {
+        unc_path
+    } else {
+        path_to_open
+    };
+
+    let mut cmd = std::process::Command::new("explorer.exe");
+    let _ = cmd.arg(&target).spawn().map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 pub const EMBEDDED_PUBLIC_KEY: [u8; 32] = [
@@ -659,5 +1067,31 @@ pub fn init_app_state() -> AppState {
         is_hosting: Mutex::new(false),
         host_code: Mutex::new("OFFICE-HQ-01".into()),
         host_status_message: Mutex::new("Offline".into()),
+        active_server_ip: Mutex::new(None),
+        host_share_name: Mutex::new("SharedData".into()),
+        host_share_path: Mutex::new(r"C:\SharedData".into()),
+        discovered_shares: Arc::new(Mutex::new(Vec::new())),
+        host_connected_clients: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        host_max_nodes: Arc::new(Mutex::new(3)),
     }
+}
+
+#[tauri::command]
+pub async fn open_external_url(url: String) -> Result<(), String> {
+    let target = url.trim().to_string();
+    if !target.starts_with("http://") && !target.starts_with("https://") {
+        return Err("Invalid URL protocol".into());
+    }
+
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.creation_flags(0x08000000);
+        let _ = cmd
+            .args(["/c", "start", "", &target])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }

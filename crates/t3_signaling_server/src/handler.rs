@@ -2,13 +2,12 @@ use crate::registry::PeerRegistry;
 use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use t3_domain::SignalingMessage;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use t3_domain::SignalingMessage;
 
-pub async fn handle_connection(mut raw_stream: TcpStream, addr: SocketAddr, registry: Arc<PeerRegistry>) {
+pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry: Arc<PeerRegistry>) {
     // 1. Check for standard HTTP health-check requests (Render / uptime checks / browser visits)
     let mut peek_buf = [0u8; 1024];
     let n = raw_stream.peek(&mut peek_buf).await.unwrap_or(0);
@@ -17,25 +16,8 @@ pub async fn handle_connection(mut raw_stream: TcpStream, addr: SocketAddr, regi
     let is_ws_upgrade = peek_str.to_lowercase().contains("upgrade: websocket");
 
     if !is_ws_upgrade {
-        let body = "{\"status\":\"ok\",\"service\":\"t3Bridge Cloud Signaling Rendezvous Server\"}\n";
-        if peek_str.starts_with("HEAD ") {
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = raw_stream.write_all(response.as_bytes()).await;
-            let _ = raw_stream.flush().await;
-            return;
-        } else if peek_str.starts_with("GET ") || peek_str.starts_with("OPTIONS ") {
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = raw_stream.write_all(response.as_bytes()).await;
-            let _ = raw_stream.flush().await;
-            return;
-        }
+        crate::admin_http::handle_http(raw_stream, addr).await;
+        return;
     }
 
     let ws_stream = match tokio_tungstenite::accept_async(raw_stream).await {

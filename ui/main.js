@@ -40,6 +40,7 @@ const displayHwid = document.getElementById('displayHwid');
 const btnCopyHwid = document.getElementById('btnCopyHwid');
 const btnConnect = document.getElementById('btnConnect');
 const btnDisconnect = document.getElementById('btnDisconnect');
+const btnOpenFolder = document.getElementById('btnOpenFolder');
 const appProfileSelect = document.getElementById('appProfileSelect');
 const targetPeerId = document.getElementById('targetPeerId');
 const driveLetter = document.getElementById('driveLetter');
@@ -53,17 +54,7 @@ const watchdogBanner = document.getElementById('watchdogBanner');
 const watchdogIcon = document.getElementById('watchdogIcon');
 const watchdogText = document.getElementById('watchdogText');
 const btnActivateLicense = document.getElementById('btnActivateLicense');
-const signalingServerUrl = document.getElementById('signalingServerUrl');
-
-if (signalingServerUrl) {
-  const savedSignaling = localStorage.getItem('t3_signaling_url');
-  if (savedSignaling) {
-    signalingServerUrl.value = savedSignaling;
-  }
-  signalingServerUrl.addEventListener('change', () => {
-    localStorage.setItem('t3_signaling_url', signalingServerUrl.value.trim());
-  });
-}
+const DEFAULT_SIGNALING_URL = 'wss://t3bridge-signaling.onrender.com';
 const licenseInput = document.getElementById('licenseInput');
 const licenseAlert = document.getElementById('licenseAlert');
 
@@ -75,107 +66,163 @@ const btnGoToLicense = document.getElementById('btnGoToLicense');
 const displayLicenseTier = document.getElementById('displayLicenseTier');
 const displayLicenseDetail = document.getElementById('displayLicenseDetail');
 
-// Custom Profile Elements
-const btnToggleNewProfile = document.getElementById('btnToggleNewProfile');
-const newProfileContainer = document.getElementById('newProfileContainer');
-const btnCloseProfileBox = document.getElementById('btnCloseProfileBox');
-const newProfileName = document.getElementById('newProfileName');
-const newProfileShare = document.getElementById('newProfileShare');
-const btnSaveCustomProfile = document.getElementById('btnSaveCustomProfile');
-const btnDeleteProfile = document.getElementById('btnDeleteProfile');
+// Discovered Shares DOM Elements
+const sharesCard = document.getElementById('sharesCard');
+const sharesList = document.getElementById('sharesList');
+const sharesCountBadge = document.getElementById('sharesCountBadge');
+const customShareInput = document.getElementById('customShareInput');
+const btnUseCustomShare = document.getElementById('btnUseCustomShare');
+const btnMountShare = document.getElementById('btnMountShare');
+let selectedShareName = null;
 
-// Default Profiles
-const defaultProfiles = [
-  { id: "primary_erp", name: "Primary Business ERP (Database & Share)", share: "SharedData" },
-  { id: "branch_share", name: "Branch Accounting & Document Share", share: "BranchData" },
-  { id: "smb_share", name: "General SMB Network Share", share: "Share" },
-];
-
-function getCustomProfiles() {
-  try {
-    return JSON.parse(localStorage.getItem('t3_custom_profiles')) || [];
-  } catch {
-    return [];
-  }
-}
-
-function saveCustomProfiles(profiles) {
-  localStorage.setItem('t3_custom_profiles', JSON.stringify(profiles));
-}
-
-function renderProfiles(selectedId = null) {
-  const customs = getCustomProfiles();
-  const allProfiles = [...defaultProfiles, ...customs];
-
-  appProfileSelect.innerHTML = '';
-  allProfiles.forEach(p => {
-    const opt = document.createElement('option');
-    opt.value = p.id;
-    opt.textContent = p.isCustom ? `${p.name} (Custom)` : p.name;
-    opt.dataset.isCustom = p.isCustom ? "true" : "false";
-    opt.dataset.share = p.share || "SharedData";
-    opt.dataset.name = p.name;
-    appProfileSelect.appendChild(opt);
+function selectShare(name) {
+  selectedShareName = name;
+  document.querySelectorAll('.share-card-item').forEach(card => {
+    if (card.dataset.share === name) {
+      card.classList.add('selected');
+    } else {
+      card.classList.remove('selected');
+    }
   });
-
-  if (selectedId && allProfiles.some(p => p.id === selectedId)) {
-    appProfileSelect.value = selectedId;
+  if (customShareInput) {
+    customShareInput.value = name;
   }
-
-  updateProfileButtons();
-}
-
-function updateProfileButtons() {
-  const selectedOpt = appProfileSelect.options[appProfileSelect.selectedIndex];
-  if (selectedOpt && selectedOpt.dataset.isCustom === "true") {
-    btnDeleteProfile.style.display = "inline-block";
-  } else {
-    btnDeleteProfile.style.display = "none";
+  const letter = driveLetter ? driveLetter.value : 'Z';
+  if (btnMountShare) {
+    btnMountShare.disabled = false;
+    btnMountShare.textContent = `Map "${name}" to Drive ${letter}:`;
   }
 }
 
-appProfileSelect.addEventListener('change', updateProfileButtons);
-
-btnToggleNewProfile.addEventListener('click', () => {
-  newProfileContainer.style.display = newProfileContainer.style.display === "none" ? "block" : "none";
-  if (newProfileContainer.style.display === "block") {
-    newProfileName.focus();
+function renderDiscoveredShares(shares) {
+  if (!sharesList) return;
+  sharesList.innerHTML = '';
+  selectedShareName = null;
+  if (btnMountShare) {
+    btnMountShare.disabled = true;
+    btnMountShare.textContent = "Select a Folder to Map";
   }
-});
 
-btnCloseProfileBox.addEventListener('click', () => {
-  newProfileContainer.style.display = "none";
-});
-
-btnSaveCustomProfile.addEventListener('click', () => {
-  const name = newProfileName.value.trim();
-  const share = newProfileShare.value.trim() || "SharedData";
-
-  if (!name) {
-    alert("Please enter an Application Name (e.g. 'My Godown Inventory')");
+  if (!shares || shares.length === 0) {
+    if (sharesCountBadge) {
+      sharesCountBadge.textContent = "Suggested";
+      sharesCountBadge.className = "badge-secondary";
+    }
+    sharesList.innerHTML = `
+      <div style="grid-column: 1 / -1; padding: 10px 14px; background: rgba(59, 130, 246, 0.1); border: 1px dashed rgba(59, 130, 246, 0.4); border-radius: 8px; color: #93c5fd; font-size: 12px; line-height: 1.5;">
+        💡 <b>Click your shared folder below</b> or type its name in the box:
+      </div>
+      <div class="share-card-item" data-share="python">
+        <span class="share-card-icon">📁</span>
+        <div class="share-card-info">
+          <span class="share-card-name">python</span>
+          <span class="share-card-type">Suggested Share</span>
+        </div>
+      </div>
+      <div class="share-card-item" data-share="SharedData">
+        <span class="share-card-icon">📁</span>
+        <div class="share-card-info">
+          <span class="share-card-name">SharedData</span>
+          <span class="share-card-type">Suggested Share</span>
+        </div>
+      </div>
+      <div class="share-card-item" data-share="MargERP">
+        <span class="share-card-icon">📁</span>
+        <div class="share-card-info">
+          <span class="share-card-name">MargERP</span>
+          <span class="share-card-type">Suggested Share</span>
+        </div>
+      </div>
+    `;
+    sharesList.querySelectorAll('.share-card-item').forEach(card => {
+      card.addEventListener('click', () => {
+        selectShare(card.dataset.share);
+      });
+    });
+    // Auto-select python by default so the Mount button is immediately ready
+    selectShare("python");
     return;
   }
 
-  const customs = getCustomProfiles();
-  const id = `custom_${Date.now()}`;
-  customs.push({ id, name, share, isCustom: true });
-  saveCustomProfiles(customs);
+  if (sharesCountBadge) {
+    sharesCountBadge.textContent = `${shares.length} folder${shares.length > 1 ? 's' : ''}`;
+    sharesCountBadge.className = "badge-success";
+  }
 
-  newProfileName.value = '';
-  newProfileShare.value = 'SharedData';
-  newProfileContainer.style.display = "none";
+  shares.forEach(share => {
+    const card = document.createElement('div');
+    card.className = "share-card-item";
+    card.dataset.share = share;
+    card.innerHTML = `
+      <span class="share-card-icon">📁</span>
+      <div class="share-card-info">
+        <span class="share-card-name">${share}</span>
+        <span class="share-card-type">Shared Folder</span>
+      </div>
+    `;
+    card.addEventListener('click', () => {
+      selectShare(share);
+    });
+    sharesList.appendChild(card);
+  });
 
-  renderProfiles(id);
-});
+  // Automatically select the first share
+  if (shares.length > 0) {
+    selectShare(shares[0]);
+  }
+}
 
-btnDeleteProfile.addEventListener('click', () => {
-  const selectedId = appProfileSelect.value;
-  if (!confirm("Are you sure you want to remove this custom profile?")) return;
+if (customShareInput) {
+  // Reactive typing: immediately update selected share as user types
+  customShareInput.addEventListener('input', () => {
+    const val = customShareInput.value.trim();
+    if (val) {
+      selectedShareName = val;
+      const letter = driveLetter ? driveLetter.value : 'Z';
+      if (btnMountShare) {
+        btnMountShare.disabled = false;
+        btnMountShare.textContent = `Map "${val}" to Drive ${letter}:`;
+      }
+    } else {
+      selectedShareName = null;
+      if (btnMountShare) {
+        btnMountShare.disabled = true;
+        btnMountShare.textContent = "Select a Folder to Map";
+      }
+    }
+  });
 
-  const customs = getCustomProfiles().filter(p => p.id !== selectedId);
-  saveCustomProfiles(customs);
-  renderProfiles("primary_erp");
-});
+  // Press Enter inside input to instantly mount
+  customShareInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const val = customShareInput.value.trim();
+      if (val) {
+        selectShare(val);
+        if (btnMountShare && !btnMountShare.disabled) {
+          btnMountShare.click();
+        }
+      }
+    }
+  });
+}
+
+if (btnUseCustomShare && customShareInput) {
+  btnUseCustomShare.addEventListener('click', () => {
+    const val = customShareInput.value.trim();
+    if (val) {
+      selectShare(val);
+    }
+  });
+}
+
+if (driveLetter) {
+  driveLetter.addEventListener('change', () => {
+    const letter = driveLetter.value;
+    if (selectedShareName && btnMountShare) {
+      btnMountShare.textContent = `Map "${selectedShareName}" to Drive ${letter}:`;
+    }
+  });
+}
 
 // 1. Tab Switching
 tabBtns.forEach(btn => {
@@ -272,58 +319,107 @@ function setAnimationConnected() {
   serverLed3.setAttribute('class', 'led-connected');
 }
 
-// 3. Connect Bridge
+// 3. Connect to Server & Discover Shares
 btnConnect.addEventListener('click', async () => {
   const hostVal = targetPeerId.value.trim();
   if (!hostVal) {
-    alert("Please enter the Office Server IP address or Hostname (e.g. 192.168.1.100 or SERVER-PC).");
+    alert("Please enter the Office Server IP address or Connect Code (e.g. 192.168.1.100 or OFFICE-HO-01).");
     targetPeerId.focus();
     return;
   }
 
   btnConnect.disabled = true;
-  btnConnect.textContent = "Connecting...";
+  btnConnect.textContent = "Connecting to Server...";
 
-  // Start the connecting animation
+  // Start connecting animation
   setAnimationConnecting();
+  if (sharesCard) sharesCard.style.display = "none";
 
   try {
-    const selectedOpt = appProfileSelect.options[appProfileSelect.selectedIndex];
-    const isCustom = selectedOpt && selectedOpt.dataset.isCustom === "true";
-    const customName = isCustom ? selectedOpt.dataset.name : null;
-    const customShare = isCustom ? selectedOpt.dataset.share : null;
+    const activeSignaling = DEFAULT_SIGNALING_URL;
 
-    const res = await invoke('connect_bridge', {
-      targetPeerId: targetPeerId.value.trim(),
-      appId: appProfileSelect.value,
-      customName: customName,
-      customShare: customShare,
-      driveLetter: driveLetter.value,
-      signalingUrl: signalingServerUrl ? signalingServerUrl.value.trim() : null
+    // Phase 1: Establish tunnel / link
+    const peerInfo = await invoke('connect_peer_only', {
+      targetPeerId: hostVal,
+      signalingUrl: activeSignaling
     });
 
-    isConnected = true;
-    const status = await invoke('get_session_status');
+    btnConnect.textContent = "Discovering Folders...";
 
-    // Show connected animation
-    setAnimationConnected();
+    // Phase 2: Fetch list of shares from the server
+    let shares = [];
+    try {
+      shares = await invoke('list_server_shares');
+    } catch (e) {
+      console.warn("list_server_shares warning:", e);
+      shares = [];
+    }
 
-    updateUiStatus(status);
+    if (sharesCard) {
+      sharesCard.style.display = "block";
+      renderDiscoveredShares(shares);
+    }
+
+    btnConnect.textContent = "✓ Server Connected";
+    btnConnect.className = "btn btn-secondary";
   } catch (err) {
-    // Reset animation on error
     setAnimationIdle();
+    btnConnect.textContent = "Connect & View Folders";
+    btnConnect.className = "btn btn-primary";
     alert(`Connection Error: ${err}`);
   } finally {
     btnConnect.disabled = false;
-    btnConnect.textContent = "Connect Bridge";
   }
 });
+
+// Map Selected Folder to Drive
+if (btnMountShare) {
+  btnMountShare.addEventListener('click', async () => {
+    const shareToMount = selectedShareName || (customShareInput ? customShareInput.value.trim() : null);
+    if (!shareToMount) {
+      alert("Please select or enter a shared folder name first.");
+      return;
+    }
+
+    btnMountShare.disabled = true;
+    btnMountShare.textContent = `Mapping "${shareToMount}" to Drive ${driveLetter ? driveLetter.value : 'Z'}: ...`;
+
+    try {
+      const letter = driveLetter ? driveLetter.value : 'Z';
+      await invoke('mount_selected_share', {
+        shareName: shareToMount,
+        driveLetter: letter
+      });
+
+      isConnected = true;
+      const status = await invoke('get_session_status');
+      setAnimationConnected();
+      updateUiStatus(status);
+
+      if (sharesCard) {
+        sharesCard.style.display = "none";
+      }
+    } catch (err) {
+      alert(`Mount Error:\n${err}\n\nPlease check:\n1. On Server PC: Ensure Host Mode is active and shows "Broadcasting on Cloud Mesh".\n2. Share Name: Verify the share "${shareToMount}" exists on the Host.`);
+    } finally {
+      btnMountShare.disabled = false;
+      const letter = driveLetter ? driveLetter.value : 'Z';
+      btnMountShare.textContent = selectedShareName
+        ? `Map "${selectedShareName}" to Drive ${letter}:`
+        : `Map Selected Folder to Drive ${letter}:`;
+    }
+  });
+}
 
 // 4. Disconnect Bridge
 btnDisconnect.addEventListener('click', async () => {
   try {
     await invoke('disconnect_bridge');
     isConnected = false;
+    selectedShareName = null;
+    if (sharesCard) sharesCard.style.display = "none";
+    btnConnect.textContent = "Connect & View Folders";
+    btnConnect.className = "btn btn-primary";
     const status = await invoke('get_session_status');
     setAnimationIdle();
     updateUiStatus(status);
@@ -331,6 +427,17 @@ btnDisconnect.addEventListener('click', async () => {
     alert(`Disconnect Error: ${err}`);
   }
 });
+
+// Open Mapped Folder in Windows Explorer
+if (btnOpenFolder) {
+  btnOpenFolder.addEventListener('click', async () => {
+    try {
+      await invoke('open_folder', { driveLetter: driveLetter ? driveLetter.value : null });
+    } catch (err) {
+      alert(`Could not open folder in Explorer: ${err}`);
+    }
+  });
+}
 
 // 5. Activate License
 btnActivateLicense.addEventListener('click', async () => {
@@ -414,9 +521,13 @@ function updateUiStatus(status) {
     statusText.textContent = `Bridged (${status.drive_letter || 'Z'}:)`;
     btnConnect.style.display = "none";
     btnDisconnect.style.display = "inline-block";
+    if (btnOpenFolder) {
+      btnOpenFolder.style.display = "inline-block";
+      btnOpenFolder.textContent = `📂 Open Folder (${status.drive_letter || 'Z'}:)`;
+    }
     metricLatency.textContent = `${status.latency_ms} ms`;
-    metricIp.textContent = "10.99.0.1";
-    metricPath.textContent = `${status.drive_letter || 'Z'}: -> SharedData`;
+    metricIp.textContent = status.target_ip || "10.99.0.1";
+    metricPath.textContent = status.mapped_unc || `${status.drive_letter || 'Z'}:`;
 
     metricHealth.textContent = status.health_level || "Optimal";
     if (status.health_level === "Optimal") metricHealth.classList.add("health-optimal");
@@ -447,6 +558,7 @@ function updateUiStatus(status) {
     statusText.textContent = "Disconnected";
     btnConnect.style.display = "inline-block";
     btnDisconnect.style.display = "none";
+    if (btnOpenFolder) btnOpenFolder.style.display = "none";
     metricLatency.textContent = "-- ms";
     metricHealth.textContent = "--";
     metricIp.textContent = "--";
@@ -480,22 +592,65 @@ setInterval(async () => {
 const toggleHostMode = document.getElementById('toggleHostMode');
 const hostConnectCodeInput = document.getElementById('hostConnectCodeInput');
 const hostStatusBadge = document.getElementById('hostStatusBadge');
+const btnCopyHostCode = document.getElementById('btnCopyHostCode');
+const hostActiveSharesContainer = document.getElementById('hostActiveSharesContainer');
+
+if (btnCopyHostCode && hostConnectCodeInput) {
+  btnCopyHostCode.addEventListener('click', () => {
+    navigator.clipboard.writeText(hostConnectCodeInput.value.trim());
+    btnCopyHostCode.textContent = "Copied!";
+    setTimeout(() => { btnCopyHostCode.textContent = "Copy Code"; }, 2000);
+  });
+}
+
+function renderHostShares(shares) {
+  if (!hostActiveSharesContainer) return;
+  hostActiveSharesContainer.innerHTML = '';
+  if (!shares || shares.length === 0) {
+    hostActiveSharesContainer.innerHTML = '<span class="badge-secondary">None detected (C:\\SharedData active)</span>';
+    return;
+  }
+  shares.forEach(s => {
+    const chip = document.createElement('span');
+    chip.className = 'badge-success';
+    chip.style.cssText = 'padding: 4px 10px; font-size: 12px; display: inline-flex; align-items: center; gap: 4px;';
+    chip.innerHTML = `📁 <strong>${s}</strong>`;
+    hostActiveSharesContainer.appendChild(chip);
+  });
+}
 
 if (toggleHostMode) {
   toggleHostMode.addEventListener('change', async () => {
     if (toggleHostMode.checked) {
       const code = hostConnectCodeInput ? hostConnectCodeInput.value.trim().toUpperCase() : "OFFICE-HQ-01";
-      const signalingUrl = signalingServerUrl ? signalingServerUrl.value.trim() : null;
+      const signalingUrl = DEFAULT_SIGNALING_URL;
+
       try {
         hostStatusBadge.textContent = "Connecting to Cloud Mesh...";
         hostStatusBadge.className = "badge-secondary";
-        const res = await invoke('start_host_mode', { connectCode: code, signalingUrl: signalingUrl });
+        const res = await invoke('start_host_mode', {
+          connectCode: code,
+          signalingUrl: signalingUrl,
+          shareFolderPath: null,
+          shareName: null,
+        });
         hostStatusBadge.textContent = "● Broadcasting on Cloud Mesh (" + res.host_code + ")";
         hostStatusBadge.className = "badge-success";
+        renderHostShares(res.detected_shares);
+        if (hostActiveNodesBadge) {
+          const act = res.active_nodes || 0;
+          const max = res.max_nodes || 3;
+          hostActiveNodesBadge.textContent = `${act} / ${max} Nodes Connected`;
+          hostActiveNodesBadge.className = "badge-success";
+        }
       } catch (err) {
         toggleHostMode.checked = false;
         hostStatusBadge.textContent = "Offline (Error)";
         hostStatusBadge.className = "badge-danger";
+        if (hostActiveNodesBadge) {
+          hostActiveNodesBadge.textContent = "0 / 3 Nodes (Offline)";
+          hostActiveNodesBadge.className = "badge-secondary";
+        }
         alert("Failed to start Host Server Mode: " + err);
       }
     } else {
@@ -503,6 +658,13 @@ if (toggleHostMode) {
         await invoke('stop_host_mode');
         hostStatusBadge.textContent = "Offline (Toggle to Start)";
         hostStatusBadge.className = "badge-secondary";
+        if (hostActiveNodesBadge) {
+          hostActiveNodesBadge.textContent = "0 / 3 Nodes (Offline)";
+          hostActiveNodesBadge.className = "badge-secondary";
+        }
+        if (hostActiveSharesContainer) {
+          hostActiveSharesContainer.innerHTML = '<span class="badge-secondary">Auto-detected when host starts</span>';
+        }
       } catch (err) {
         console.error(err);
       }
@@ -510,11 +672,59 @@ if (toggleHostMode) {
   });
 }
 
+// Auto-Update and Node Badge Elements
+const CURRENT_APP_VERSION = "0.1.0";
+const updateBanner = document.getElementById('updateBanner');
+const updateVersionTitle = document.getElementById('updateVersionTitle');
+const updateNotes = document.getElementById('updateNotes');
+const btnDownloadUpdate = document.getElementById('btnDownloadUpdate');
+const btnDismissUpdate = document.getElementById('btnDismissUpdate');
+const hostActiveNodesBadge = document.getElementById('hostActiveNodesBadge');
+
+let latestDownloadUrl = 'https://github.com/t3bridge/t3SharePlus/releases/latest';
+
+if (btnDismissUpdate && updateBanner) {
+  btnDismissUpdate.addEventListener('click', () => {
+    updateBanner.style.display = 'none';
+  });
+}
+
+if (btnDownloadUpdate) {
+  btnDownloadUpdate.addEventListener('click', async () => {
+    try {
+      await invoke('open_external_url', { url: latestDownloadUrl });
+    } catch (_) {
+      window.open(latestDownloadUrl, '_blank');
+    }
+  });
+}
+
+async function checkForUpdates() {
+  try {
+    const res = await fetch('https://t3bridge-signaling.onrender.com/api/version');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.version && data.version !== CURRENT_APP_VERSION) {
+      if (updateBanner && updateVersionTitle) {
+        updateVersionTitle.textContent = `New Version ${data.version} Available!`;
+        if (updateNotes) updateNotes.textContent = data.release_notes || 'Improvements & bug fixes.';
+        if (data.download_url) latestDownloadUrl = data.download_url;
+        updateBanner.style.display = 'flex';
+      }
+    }
+  } catch (_) {
+    // Silent fail if offline or rendering sleeping
+  }
+}
+
 // Initialize on page load
-renderProfiles();
 loadHwid();
 loadLicenseStatus();
 loadHostStatus();
+checkForUpdates();
+
+// Check for updates every 30 minutes in background
+setInterval(checkForUpdates, 30 * 60 * 1000);
 
 async function loadHostStatus() {
   try {
@@ -524,9 +734,20 @@ async function loadHostStatus() {
       if (status.is_hosting) {
         hostStatusBadge.textContent = "● " + status.message + " (" + status.host_code + ")";
         hostStatusBadge.className = status.message.toLowerCase().includes("broadcasting") ? "badge-success" : "badge-secondary";
+        renderHostShares(status.detected_shares);
+        if (hostActiveNodesBadge) {
+          const act = status.active_nodes || 0;
+          const max = status.max_nodes || 3;
+          hostActiveNodesBadge.textContent = `${act} / ${max} Nodes Connected`;
+          hostActiveNodesBadge.className = act >= max ? "badge-secondary" : "badge-success";
+        }
       } else {
         hostStatusBadge.textContent = "Offline (Toggle to Start)";
         hostStatusBadge.className = "badge-secondary";
+        if (hostActiveNodesBadge) {
+          hostActiveNodesBadge.textContent = "0 / 3 Nodes (Offline)";
+          hostActiveNodesBadge.className = "badge-secondary";
+        }
       }
     }
   } catch (err) {

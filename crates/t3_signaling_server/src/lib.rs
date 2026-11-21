@@ -1,3 +1,4 @@
+pub mod admin_http;
 pub mod handler;
 pub mod registry;
 

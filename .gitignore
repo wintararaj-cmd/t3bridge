@@ -32,6 +32,8 @@ $RECYCLE.BIN/
 *.swo
 *~
 .DS_Store
+.agents/
+mcp_config.json
 
 # Secrets & Licenses (Private Keys should NEVER be committed)
 *.key
