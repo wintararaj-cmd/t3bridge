@@ -89,6 +89,41 @@ struct IssueLicenseReq {
     passcode: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct VerifyPasscodeReq {
+    passcode: String,
+}
+
+fn extract_auth_passcode(header_str: &str, path: &str) -> Option<String> {
+    header_str
+        .lines()
+        .find_map(|l| {
+            let lower = l.to_lowercase();
+            if lower.starts_with("authorization:") {
+                let val = l[14..].trim();
+                if val.to_lowercase().starts_with("bearer ") {
+                    Some(val[7..].trim().to_string())
+                } else {
+                    Some(val.to_string())
+                }
+            } else if lower.starts_with("x-admin-passcode:") {
+                Some(l[17..].trim().to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            if let Some(pos) = path.find("passcode=") {
+                let query = &path[pos + 9..];
+                let val = query.split('&').next().unwrap_or("");
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+            None
+        })
+}
+
 pub async fn handle_http(mut stream: TcpStream, addr: SocketAddr) {
     let mut buf = Vec::with_capacity(8192);
     let mut temp = [0u8; 2048];
@@ -167,6 +202,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         let resp = format!(
             "HTTP/1.1 200 OK\r\n\
 Content-Type: text/html; charset=utf-8\r\n\
+Access-Control-Allow-Origin: *\r\n\
 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             html.len(),
             html
@@ -176,8 +212,9 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         return;
     }
 
-    if path == "/api/admin/issue" && method == "POST" {
-        // Read Content-Length
+    // Read POST body if applicable
+    let mut body_bytes = Vec::new();
+    if method == "POST" {
         let content_len = header_str
             .lines()
             .find(|l| l.to_lowercase().starts_with("content-length:"))
@@ -185,7 +222,7 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
 
-        let mut body_bytes = buf[header_end_pos..].to_vec();
+        body_bytes = buf[header_end_pos..].to_vec();
         while body_bytes.len() < content_len {
             match stream.read(&mut temp).await {
                 Ok(0) => break,
@@ -193,7 +230,43 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 Err(_) => break,
             }
         }
+    }
 
+    if path == "/api/admin/verify" && method == "POST" {
+        let req: Result<VerifyPasscodeReq, _> = serde_json::from_slice(&body_bytes);
+        let expected_secret = get_admin_secret();
+
+        let provided = match req {
+            Ok(r) => r.passcode,
+            Err(_) => extract_auth_passcode(&header_str, path).unwrap_or_default(),
+        };
+
+        if provided.trim() != expected_secret {
+            send_json_error(&mut stream, 401, "Invalid Master Passcode! Access Denied.").await;
+            return;
+        }
+
+        let resp_body = serde_json::json!({
+            "success": true,
+            "authenticated": true,
+            "message": "Access granted"
+        })
+        .to_string();
+
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\n\
+Content-Type: application/json\r\n\
+Access-Control-Allow-Origin: *\r\n\
+Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            resp_body.len(),
+            resp_body
+        );
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+
+    if path == "/api/admin/issue" && method == "POST" {
         let req: IssueLicenseReq = match serde_json::from_slice(&body_bytes) {
             Ok(r) => r,
             Err(e) => {
@@ -209,8 +282,14 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
 
         // Authenticate passcode
         let expected_secret = get_admin_secret();
-        let provided = req.passcode.as_deref().unwrap_or("");
-        if provided != expected_secret {
+        let provided = req
+            .passcode
+            .as_deref()
+            .map(|s| s.to_string())
+            .or_else(|| extract_auth_passcode(&header_str, path))
+            .unwrap_or_default();
+
+        if provided.trim() != expected_secret {
             send_json_error(&mut stream, 401, "Invalid Master Passcode! Access Denied.").await;
             return;
         }
@@ -312,6 +391,13 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{}",
     }
 
     if path.starts_with("/api/admin/history") {
+        let expected_secret = get_admin_secret();
+        let provided = extract_auth_passcode(&header_str, path).unwrap_or_default();
+        if provided != expected_secret {
+            send_json_error(&mut stream, 401, "Unauthorized: Master Passcode required.").await;
+            return;
+        }
+
         let hist = {
             let lock = LICENSE_HISTORY.lock().unwrap();
             lock.clone()
@@ -376,8 +462,11 @@ fn get_admin_dashboard_html() -> &'static str {
     body { background: #0b0f19; color: #f1f5f9; padding: 16px; min-height: 100vh; }
     .container { max-width: 680px; margin: 0 auto; }
     .header { text-align: center; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid #1e293b; }
+    .header-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
     .header h1 { font-size: 22px; color: #38bdf8; font-weight: 700; letter-spacing: -0.5px; }
     .header p { font-size: 13px; color: #94a3b8; margin-top: 4px; }
+    .btn-lock { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+    .btn-lock:hover { background: rgba(239, 68, 68, 0.25); color: #fca5a5; }
     .card { background: #131d31; border: 1px solid #1e293b; border-radius: 12px; padding: 18px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); }
     .card-title { font-size: 15px; font-weight: 600; color: #e2e8f0; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
     .form-group { margin-bottom: 14px; }
@@ -399,94 +488,121 @@ fn get_admin_dashboard_html() -> &'static str {
     .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; background: #0369a1; color: #e0f2fe; }
     .history-item { padding: 10px; border-bottom: 1px solid #1e293b; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
     .history-item:last-child { border-bottom: none; }
+    .login-card { border: 1px solid #0284c7; background: linear-gradient(145deg, #0f172a, #131d31); padding: 28px 24px; box-shadow: 0 8px 32px rgba(2, 132, 199, 0.15); }
+    .lock-icon-circle { width: 56px; height: 56px; border-radius: 50%; background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.3); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px; font-size: 26px; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <h1>⚡ t3Bridge License Generator</h1>
+      <div class="header-bar">
+        <h1>⚡ t3Bridge License Generator</h1>
+        <button type="button" id="btnLockPortal" class="btn-lock" style="display: none;">🔒 Lock Portal</button>
+      </div>
       <p>Secure Commercial License Management Portal</p>
     </div>
 
-    <!-- Auth / Passcode Card -->
-    <div class="card" id="authCard">
-      <div class="card-title">🔐 Master Security Access</div>
+    <!-- Login Gate / Master Passcode Access (Default View: Locked) -->
+    <div class="card login-card" id="loginGate">
+      <div style="text-align: center; margin-bottom: 20px;">
+        <div class="lock-icon-circle">🔐</div>
+        <h2 style="font-size: 17px; color: #f8fafc; font-weight: 700;">Master Security Access Required</h2>
+        <p style="font-size: 12px; color: #94a3b8; margin-top: 6px; line-height: 1.5;">
+          This portal generates cryptographically signed commercial licenses. Enter your master administrator passcode to unlock.
+        </p>
+      </div>
+
       <div class="form-group">
         <label for="adminPasscode">Master Passcode</label>
-        <input type="password" id="adminPasscode" placeholder="Enter admin passcode" />
+        <input type="password" id="adminPasscode" placeholder="Enter admin passcode" autocomplete="current-password" autofocus />
       </div>
+
+      <button type="button" id="btnUnlock" class="btn btn-primary">
+        🔓 Authenticate &amp; Unlock Portal
+      </button>
+
+      <div id="loginStatusMsg" class="status-msg"></div>
     </div>
 
-    <!-- Generator Card -->
-    <div class="card">
-      <div class="card-title">📝 Issue Commercial License</div>
-      
-      <div class="form-group">
-        <label for="custName">Customer / Company Name</label>
-        <input type="text" id="custName" placeholder="e.g. ABC Trading Co." />
-      </div>
-
-      <div class="form-group">
-        <label for="hwid">Target Machine HWID</label>
-        <input type="text" id="hwid" placeholder="e.g. T3-0B86-8ED7-EBE4" style="text-transform: uppercase;" />
-      </div>
-
-      <div class="grid-2">
+    <!-- Generator & Management Portal Container (Hidden until authenticated) -->
+    <div id="portalContent" style="display: none;">
+      <!-- Generator Card -->
+      <div class="card">
+        <div class="card-title">📝 Issue Commercial License</div>
+        
         <div class="form-group">
-          <label for="nodePlan">Package & Seats</label>
-          <select id="nodePlan">
-            <option value="3" selected>1 Host + 3 Clients (Starter Pack - 3 Nodes)</option>
-            <option value="5">1 Host + 5 Clients (Extended - 5 Nodes)</option>
-            <option value="10">1 Host + 10 Clients (Enterprise - 10 Nodes)</option>
-            <option value="1">Single Node (Client Add-on)</option>
-            <option value="custom">Custom Node Count...</option>
-          </select>
-        </div>
-
-        <div class="form-group" id="customNodeGroup" style="display: none;">
-          <label for="customNodes">Custom Nodes</label>
-          <input type="number" id="customNodes" min="1" max="100" value="4" />
+          <label for="custName">Customer / Company Name</label>
+          <input type="text" id="custName" placeholder="e.g. ABC Trading Co." />
         </div>
 
         <div class="form-group">
-          <label for="validity">License Validity</label>
-          <select id="validity">
-            <option value="365" selected>1 Year (365 Days) — Standard</option>
-            <option value="730">2 Years (730 Days)</option>
-            <option value="0">Lifetime / Perpetual (No Expiry)</option>
-            <option value="30">30 Days (Extended Trial)</option>
-          </select>
+          <label for="hwid">Target Machine HWID</label>
+          <input type="text" id="hwid" placeholder="e.g. T3-0B86-8ED7-EBE4" style="text-transform: uppercase;" />
+        </div>
+
+        <div class="grid-2">
+          <div class="form-group">
+            <label for="nodePlan">Package & Seats</label>
+            <select id="nodePlan">
+              <option value="3" selected>1 Host + 3 Clients (Starter Pack - 3 Nodes)</option>
+              <option value="5">1 Host + 5 Clients (Extended - 5 Nodes)</option>
+              <option value="10">1 Host + 10 Clients (Enterprise - 10 Nodes)</option>
+              <option value="1">Single Node (Client Add-on)</option>
+              <option value="custom">Custom Node Count...</option>
+            </select>
+          </div>
+
+          <div class="form-group" id="customNodeGroup" style="display: none;">
+            <label for="customNodes">Custom Nodes</label>
+            <input type="number" id="customNodes" min="1" max="100" value="4" />
+          </div>
+
+          <div class="form-group">
+            <label for="validity">License Validity</label>
+            <select id="validity">
+              <option value="365" selected>1 Year (365 Days) — Standard</option>
+              <option value="730">2 Years (730 Days)</option>
+              <option value="0">Lifetime / Perpetual (No Expiry)</option>
+              <option value="30">30 Days (Extended Trial)</option>
+            </select>
+          </div>
+        </div>
+
+        <button type="button" id="btnGenerate" class="btn btn-primary">⚡ Generate &amp; Sign License</button>
+        <div id="statusMsg" class="status-msg"></div>
+
+        <!-- Result Section -->
+        <div id="resultBox" class="result-box">
+          <div class="result-header">
+            <span id="resultTitle">✔ License Created</span>
+            <span id="resultBadge" class="badge">3 Nodes</span>
+          </div>
+          <textarea id="licenseOutput" readonly></textarea>
+          <div class="actions-grid">
+            <button type="button" id="btnCopy" class="btn btn-copy">📋 Copy Key</button>
+            <button type="button" id="btnWhatsApp" class="btn btn-whatsapp">💬 WhatsApp</button>
+          </div>
         </div>
       </div>
 
-      <button type="button" id="btnGenerate" class="btn btn-primary">⚡ Generate &amp; Sign License</button>
-      <div id="statusMsg" class="status-msg"></div>
-
-      <!-- Result Section -->
-      <div id="resultBox" class="result-box">
-        <div class="result-header">
-          <span id="resultTitle">✔ License Created</span>
-          <span id="resultBadge" class="badge">3 Nodes</span>
+      <!-- History Card -->
+      <div class="card">
+        <div class="card-title">🕒 Recently Issued Licenses</div>
+        <div id="historyList" style="max-height: 200px; overflow-y: auto;">
+          <div style="font-size: 12px; color: #64748b; text-align: center; padding: 12px;">No licenses issued in this session yet.</div>
         </div>
-        <textarea id="licenseOutput" readonly></textarea>
-        <div class="actions-grid">
-          <button type="button" id="btnCopy" class="btn btn-copy">📋 Copy Key</button>
-          <button type="button" id="btnWhatsApp" class="btn btn-whatsapp">💬 WhatsApp</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- History Card -->
-    <div class="card">
-      <div class="card-title">🕒 Recently Issued Licenses</div>
-      <div id="historyList" style="max-height: 200px; overflow-y: auto;">
-        <div style="font-size: 12px; color: #64748b; text-align: center; padding: 12px;">No licenses issued in this session yet.</div>
       </div>
     </div>
   </div>
 
   <script>
+    const loginGate = document.getElementById('loginGate');
+    const portalContent = document.getElementById('portalContent');
+    const btnLockPortal = document.getElementById('btnLockPortal');
     const adminPasscode = document.getElementById('adminPasscode');
+    const btnUnlock = document.getElementById('btnUnlock');
+    const loginStatusMsg = document.getElementById('loginStatusMsg');
+
     const custName = document.getElementById('custName');
     const hwid = document.getElementById('hwid');
     const nodePlan = document.getElementById('nodePlan');
@@ -502,11 +618,85 @@ fn get_admin_dashboard_html() -> &'static str {
     const btnWhatsApp = document.getElementById('btnWhatsApp');
     const historyList = document.getElementById('historyList');
 
-    // Auto-load saved passcode from phone/browser localStorage
-    const savedToken = localStorage.getItem('t3_admin_secret');
-    if (savedToken) adminPasscode.value = savedToken;
-    adminPasscode.addEventListener('change', () => {
-      localStorage.setItem('t3_admin_secret', adminPasscode.value.trim());
+    let activeSessionToken = '';
+
+    // Check if previously authenticated in this browser session
+    const savedSession = sessionStorage.getItem('t3_admin_session');
+    if (savedSession) {
+      verifyAndUnlock(savedSession, true);
+    }
+
+    btnUnlock.addEventListener('click', () => {
+      const passcode = adminPasscode.value.trim();
+      if (!passcode) {
+        loginStatusMsg.textContent = 'Please enter the Master Passcode.';
+        return;
+      }
+      verifyAndUnlock(passcode, false);
+    });
+
+    adminPasscode.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        btnUnlock.click();
+      }
+    });
+
+    async function verifyAndUnlock(passcode, isSilent) {
+      if (!isSilent) {
+        btnUnlock.disabled = true;
+        btnUnlock.textContent = 'Verifying Passcode...';
+        loginStatusMsg.textContent = '';
+      }
+
+      try {
+        const res = await fetch('/api/admin/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ passcode: passcode })
+        });
+        const data = await res.json();
+
+        if (res.ok && data.success) {
+          activeSessionToken = passcode;
+          sessionStorage.setItem('t3_admin_session', passcode);
+          loginGate.style.display = 'none';
+          portalContent.style.display = 'block';
+          btnLockPortal.style.display = 'inline-flex';
+          adminPasscode.value = '';
+          loginStatusMsg.textContent = '';
+          loadHistory();
+        } else {
+          sessionStorage.removeItem('t3_admin_session');
+          activeSessionToken = '';
+          loginGate.style.display = 'block';
+          portalContent.style.display = 'none';
+          btnLockPortal.style.display = 'none';
+          if (!isSilent) {
+            loginStatusMsg.textContent = data.error || 'Invalid Master Passcode! Access Denied.';
+          }
+        }
+      } catch (err) {
+        if (!isSilent) {
+          loginStatusMsg.textContent = 'Connection error: ' + err.message;
+        }
+      } finally {
+        if (!isSilent) {
+          btnUnlock.disabled = false;
+          btnUnlock.textContent = '🔓 Authenticate & Unlock Portal';
+        }
+      }
+    }
+
+    btnLockPortal.addEventListener('click', () => {
+      activeSessionToken = '';
+      sessionStorage.removeItem('t3_admin_session');
+      portalContent.style.display = 'none';
+      btnLockPortal.style.display = 'none';
+      loginGate.style.display = 'block';
+      adminPasscode.value = '';
+      loginStatusMsg.textContent = '🔒 Portal locked successfully.';
+      loginStatusMsg.style.color = '#38bdf8';
+      setTimeout(() => { loginStatusMsg.textContent = ''; loginStatusMsg.style.color = ''; }, 3000);
     });
 
     nodePlan.addEventListener('change', () => {
@@ -515,12 +705,11 @@ fn get_admin_dashboard_html() -> &'static str {
 
     btnGenerate.addEventListener('click', async () => {
       statusMsg.textContent = '';
-      const passcode = adminPasscode.value.trim();
       const customer = custName.value.trim();
       const rawHwid = hwid.value.trim().toUpperCase();
 
-      if (!passcode) {
-        statusMsg.textContent = 'Please enter the Master Passcode.';
+      if (!activeSessionToken) {
+        statusMsg.textContent = 'Session expired. Please lock and re-authenticate.';
         return;
       }
       if (!customer) {
@@ -545,13 +734,17 @@ fn get_admin_dashboard_html() -> &'static str {
       try {
         const res = await fetch('/api/admin/issue', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + activeSessionToken,
+            'X-Admin-Passcode': activeSessionToken
+          },
           body: JSON.stringify({
             customer_name: customer,
             hardware_id: rawHwid,
             max_nodes: nodes,
             days: days,
-            passcode: passcode
+            passcode: activeSessionToken
           })
         });
 
@@ -587,8 +780,14 @@ fn get_admin_dashboard_html() -> &'static str {
     });
 
     async function loadHistory() {
+      if (!activeSessionToken) return;
       try {
-        const res = await fetch('/api/admin/history');
+        const res = await fetch('/api/admin/history', {
+          headers: {
+            'Authorization': 'Bearer ' + activeSessionToken,
+            'X-Admin-Passcode': activeSessionToken
+          }
+        });
         if (!res.ok) return;
         const list = await res.json();
         if (!list || list.length === 0) return;
@@ -614,8 +813,6 @@ fn get_admin_dashboard_html() -> &'static str {
         });
       } catch (_) {}
     }
-
-    loadHistory();
   </script>
 </body>
 </html>
@@ -645,5 +842,35 @@ mod tests {
         assert!(html.contains("Master Passcode"));
         assert!(html.contains("Hardware ID"));
         assert!(html.contains("1 Host + 3 Clients"));
+    }
+
+    #[test]
+    fn test_admin_dashboard_initially_gated() {
+        let html = get_admin_dashboard_html();
+        assert!(html.contains("id=\"loginGate\""));
+        assert!(html.contains("id=\"portalContent\" style=\"display: none;\""));
+        assert!(html.contains("btnUnlock"));
+        assert!(html.contains("btnLockPortal"));
+    }
+
+    #[test]
+    fn test_extract_auth_passcode() {
+        let header_bearer = "Host: localhost\r\nAuthorization: Bearer mysecretpass\r\n";
+        assert_eq!(
+            extract_auth_passcode(header_bearer, "/api/admin/history"),
+            Some("mysecretpass".to_string())
+        );
+
+        let header_custom = "Host: localhost\r\nX-Admin-Passcode: customsecret\r\n";
+        assert_eq!(
+            extract_auth_passcode(header_custom, "/api/admin/history"),
+            Some("customsecret".to_string())
+        );
+
+        let query = "/api/admin/history?passcode=querysecret&foo=bar";
+        assert_eq!(
+            extract_auth_passcode("", query),
+            Some("querysecret".to_string())
+        );
     }
 }
