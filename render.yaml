@@ -10,3 +10,16 @@ services:
     envVars:
       - key: PORT
         value: 10000
+
+  - type: web
+    name: t3bridge-landing
+    runtime: static
+    staticPublishPath: ./landing
+    autoDeploy: true
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
