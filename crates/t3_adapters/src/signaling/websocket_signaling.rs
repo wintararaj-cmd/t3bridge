@@ -81,13 +81,26 @@ impl SignalingPort for WebSocketSignalingClient {
 
         // Inbound pump
         tokio::spawn(async move {
-            while let Some(Ok(Message::Text(text))) = ws_receiver.next().await {
-                if let Ok(msg) = serde_json::from_str::<SignalingMessage>(&text) {
-                    // Consume keepalive pong frames so they do not disrupt request/response channels
-                    if matches!(msg, SignalingMessage::Pong { .. }) {
-                        continue;
+            loop {
+                match ws_receiver.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(msg) = serde_json::from_str::<SignalingMessage>(&text) {
+                            // Consume keepalive pong frames so they do not disrupt request/response channels
+                            if matches!(msg, SignalingMessage::Pong { .. }) {
+                                continue;
+                            }
+                            if inbound_tx.send(msg).is_err() {
+                                break;
+                            }
+                        }
                     }
-                    if inbound_tx.send(msg).is_err() {
+                    Some(Ok(other)) => {
+                        // Ping/Pong/Binary frames must not terminate the pump
+                        if matches!(other, Message::Close(_)) {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) | None => {
                         break;
                     }
                 }

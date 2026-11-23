@@ -58,6 +58,41 @@ const DEFAULT_SIGNALING_URL = 'wss://t3bridge-signaling.onrender.com';
 const licenseInput = document.getElementById('licenseInput');
 const licenseAlert = document.getElementById('licenseAlert');
 
+// Password & Credentials Elements
+const hostPassword = document.getElementById('hostPassword');
+const btnToggleShowPassword = document.getElementById('btnToggleShowPassword');
+const chkRememberPassword = document.getElementById('chkRememberPassword');
+
+const hostPasswordSetInput = document.getElementById('hostPasswordSetInput');
+const btnToggleShowHostPassword = document.getElementById('btnToggleShowHostPassword');
+const btnSaveHostPassword = document.getElementById('btnSaveHostPassword');
+const hostPasswordStatusBadge = document.getElementById('hostPasswordStatusBadge');
+let isHostPasswordConfigured = false;
+
+if (btnToggleShowPassword && hostPassword) {
+  btnToggleShowPassword.addEventListener('click', () => {
+    if (hostPassword.type === 'password') {
+      hostPassword.type = 'text';
+      btnToggleShowPassword.textContent = 'Hide';
+    } else {
+      hostPassword.type = 'password';
+      btnToggleShowPassword.textContent = 'Show';
+    }
+  });
+}
+
+if (btnToggleShowHostPassword && hostPasswordSetInput) {
+  btnToggleShowHostPassword.addEventListener('click', () => {
+    if (hostPasswordSetInput.type === 'password') {
+      hostPasswordSetInput.type = 'text';
+      btnToggleShowHostPassword.textContent = 'Hide';
+    } else {
+      hostPasswordSetInput.type = 'password';
+      btnToggleShowHostPassword.textContent = 'Show';
+    }
+  });
+}
+
 // Trial & License DOM Elements
 const headerTrialBadge = document.getElementById('headerTrialBadge');
 const trialText = document.getElementById('trialText');
@@ -323,9 +358,18 @@ function setAnimationConnected() {
 btnConnect.addEventListener('click', async () => {
   const hostVal = targetPeerId.value.trim();
   if (!hostVal) {
-    alert("Please enter the Office Server IP address or Connect Code (e.g. 192.168.1.100 or OFFICE-HO-01).");
+    alert("Please enter the Office Server IP address or Connect Code (e.g. 192.168.1.100 or TRIAL-USER-XXXX).");
     targetPeerId.focus();
     return;
+  }
+
+  const pwdVal = hostPassword ? hostPassword.value.trim() : "";
+
+  // Remember or clear saved credentials
+  if (chkRememberPassword && chkRememberPassword.checked) {
+    invoke('save_client_credentials', { target: hostVal, password: pwdVal, remember: true }).catch(() => {});
+  } else {
+    invoke('save_client_credentials', { target: "", password: "", remember: false }).catch(() => {});
   }
 
   btnConnect.disabled = true;
@@ -338,9 +382,10 @@ btnConnect.addEventListener('click', async () => {
   try {
     const activeSignaling = DEFAULT_SIGNALING_URL;
 
-    // Phase 1: Establish tunnel / link
+    // Phase 1: Establish tunnel / link with host password
     const peerInfo = await invoke('connect_peer_only', {
       targetPeerId: hostVal,
+      password: pwdVal || null,
       signalingUrl: activeSignaling
     });
 
@@ -619,21 +664,62 @@ function renderHostShares(shares) {
   });
 }
 
+if (btnSaveHostPassword && hostPasswordSetInput) {
+  btnSaveHostPassword.addEventListener('click', async () => {
+    const pwd = hostPasswordSetInput.value.trim();
+    if (pwd.length < 4) {
+      alert("Host Access Password must be at least 4 characters long.");
+      hostPasswordSetInput.focus();
+      return;
+    }
+    try {
+      btnSaveHostPassword.disabled = true;
+      btnSaveHostPassword.textContent = "Saving...";
+      const res = await invoke('set_host_password', { password: pwd });
+      if (hostConnectCodeInput && res.host_code) {
+        hostConnectCodeInput.value = res.host_code;
+      }
+      isHostPasswordConfigured = res.has_password;
+      if (hostPasswordStatusBadge) {
+        hostPasswordStatusBadge.textContent = "● Password Protected";
+        hostPasswordStatusBadge.className = "badge-success";
+      }
+      hostPasswordSetInput.value = "";
+      hostPasswordSetInput.placeholder = "Change Password (min 4 chars)";
+      alert("Host Access Password set successfully!\n\nRemote branch computers will require this password to connect.");
+    } catch (err) {
+      alert("Failed to save password: " + err);
+    } finally {
+      btnSaveHostPassword.disabled = false;
+      btnSaveHostPassword.textContent = "Save Password";
+    }
+  });
+}
+
 if (toggleHostMode) {
   toggleHostMode.addEventListener('change', async () => {
     if (toggleHostMode.checked) {
-      const code = hostConnectCodeInput ? hostConnectCodeInput.value.trim().toUpperCase() : "OFFICE-HQ-01";
+      if (!isHostPasswordConfigured) {
+        toggleHostMode.checked = false;
+        alert("Please set a Host Access Password before starting Host Server Mode.\n\nRemote branch laptops require password authentication to prevent unauthorized access.");
+        if (hostPasswordSetInput) hostPasswordSetInput.focus();
+        return;
+      }
+
       const signalingUrl = DEFAULT_SIGNALING_URL;
 
       try {
         hostStatusBadge.textContent = "Connecting to Cloud Mesh...";
         hostStatusBadge.className = "badge-secondary";
         const res = await invoke('start_host_mode', {
-          connectCode: code,
+          connectCode: null,
           signalingUrl: signalingUrl,
           shareFolderPath: null,
           shareName: null,
         });
+        if (hostConnectCodeInput && res.host_code) {
+          hostConnectCodeInput.value = res.host_code;
+        }
         hostStatusBadge.textContent = "● Broadcasting on Cloud Mesh (" + res.host_code + ")";
         hostStatusBadge.className = "badge-success";
         renderHostShares(res.detected_shares);
@@ -720,11 +806,58 @@ async function checkForUpdates() {
 // Initialize on page load
 loadHwid();
 loadLicenseStatus();
+loadHostConfig();
+loadClientCredentials();
 loadHostStatus();
 checkForUpdates();
 
 // Check for updates every 30 minutes in background
 setInterval(checkForUpdates, 30 * 60 * 1000);
+
+async function loadHostConfig() {
+  try {
+    const config = await invoke('get_host_config');
+    if (config) {
+      if (hostConnectCodeInput && config.host_code) {
+        hostConnectCodeInput.value = config.host_code;
+      }
+      isHostPasswordConfigured = !!config.has_password;
+      if (hostPasswordStatusBadge) {
+        if (config.has_password) {
+          hostPasswordStatusBadge.textContent = "● Password Protected";
+          hostPasswordStatusBadge.className = "badge-success";
+          if (hostPasswordSetInput) {
+            hostPasswordSetInput.placeholder = "Change Password (min 4 chars)";
+          }
+        } else {
+          hostPasswordStatusBadge.textContent = "⚠ Password Not Set";
+          hostPasswordStatusBadge.className = "badge-warning";
+        }
+      }
+    }
+  } catch (err) {
+    console.error("loadHostConfig error:", err);
+  }
+}
+
+async function loadClientCredentials() {
+  try {
+    const creds = await invoke('get_saved_client_credentials');
+    if (creds && creds.remember) {
+      if (targetPeerId && creds.saved_target) {
+        targetPeerId.value = creds.saved_target;
+      }
+      if (hostPassword && creds.saved_password) {
+        hostPassword.value = creds.saved_password;
+      }
+      if (chkRememberPassword) {
+        chkRememberPassword.checked = true;
+      }
+    }
+  } catch (err) {
+    console.error("loadClientCredentials error:", err);
+  }
+}
 
 async function loadHostStatus() {
   try {

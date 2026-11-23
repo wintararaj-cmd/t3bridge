@@ -64,7 +64,7 @@
           <div class="grid-2">
             <div class="form-group">
               <label for="targetPeerId">Office Server (IP address or Connect Code)</label>
-              <input type="text" id="targetPeerId" class="input-control" placeholder="e.g. 192.168.1.100 or OFFICE-HO-01" value="" />
+              <input type="text" id="targetPeerId" class="input-control" placeholder="e.g. 192.168.1.100 or TRIAL-USER-XXXX" value="" />
             </div>
             <div class="form-group">
               <label for="driveLetter">Map Drive Letter</label>
@@ -74,6 +74,22 @@
                 <option value="X">X:</option>
                 <option value="W">W:</option>
               </select>
+            </div>
+          </div>
+
+          <div class="grid-2" style="margin-top: 10px;">
+            <div class="form-group">
+              <label for="hostPassword">Host Access Password</label>
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <input type="password" id="hostPassword" class="input-control" placeholder="Enter Host Password" />
+                <button type="button" id="btnToggleShowPassword" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px; white-space: nowrap;">Show</button>
+              </div>
+            </div>
+            <div class="form-group" style="display: flex; align-items: flex-end; padding-bottom: 8px;">
+              <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; font-size: 13px; font-weight: 500; color: #94a3b8; margin: 0;">
+                <input type="checkbox" id="chkRememberPassword" style="width: 16px; height: 16px; accent-color: #2563eb; cursor: pointer;" />
+                Remember Server &amp; Password
+              </label>
             </div>
           </div>
 
@@ -294,8 +310,17 @@
             <div class="info-item">
               <span class="info-label">Your Connect Code:</span>
               <div style="display: flex; gap: 8px; align-items: center;">
-                <input type="text" id="hostConnectCodeInput" class="input-control" value="OFFICE-HQ-01" style="width: 170px; font-weight: 700; text-transform: uppercase;" />
+                <input type="text" id="hostConnectCodeInput" class="input-control" value="Generating..." readonly style="width: 220px; font-weight: 700; text-transform: uppercase; background: #0f172a; border-color: #334155; cursor: default;" />
                 <button type="button" id="btnCopyHostCode" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;">Copy Code</button>
+              </div>
+            </div>
+            <div class="info-item">
+              <span class="info-label">Host Access Password:</span>
+              <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <input type="password" id="hostPasswordSetInput" class="input-control" placeholder="Set Password (min 4 chars)" style="width: 200px;" />
+                <button type="button" id="btnToggleShowHostPassword" class="btn btn-secondary" style="padding: 6px 10px; font-size: 11px;">Show</button>
+                <button type="button" id="btnSaveHostPassword" class="btn btn-primary" style="padding: 6px 12px; font-size: 12px; white-space: nowrap;">Save Password</button>
+                <span id="hostPasswordStatusBadge" class="badge-secondary" style="font-size: 11px;">Checking...</span>
               </div>
             </div>
             <div class="info-item">

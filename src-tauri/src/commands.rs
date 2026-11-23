@@ -71,6 +71,225 @@ pub struct UiSessionStatus {
     pub target_ip: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HostConfig {
+    pub host_code: String,
+    pub password_hash: String,
+    pub salt: String,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct UiHostConfig {
+    pub host_code: String,
+    pub has_password: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClientConfig {
+    pub saved_target: String,
+    pub saved_password: String,
+    pub remember: bool,
+}
+
+fn get_t3bridge_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var("LOCALAPPDATA")
+            .map(|app_data| PathBuf::from(app_data).join("t3Bridge"))
+            .unwrap_or_else(|_| PathBuf::from("."))
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(".")
+    }
+}
+
+pub fn load_host_config() -> Result<Option<HostConfig>, String> {
+    let path = get_t3bridge_dir().join("host_config.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let config: HostConfig = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    Ok(Some(config))
+}
+
+pub fn save_host_config(config: &HostConfig) -> Result<(), String> {
+    let dir = get_t3bridge_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("host_config.json");
+    let data = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    std::fs::write(&path, data).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn load_client_config() -> Result<Option<ClientConfig>, String> {
+    let path = get_t3bridge_dir().join("client_config.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let config: ClientConfig = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    Ok(Some(config))
+}
+
+pub fn save_client_config(config: &ClientConfig) -> Result<(), String> {
+    let dir = get_t3bridge_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("client_config.json");
+    let data = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    std::fs::write(&path, data).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn hash_password_with_salt(password: &str, salt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    hasher.update(password.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub async fn compute_host_code(state: &AppState) -> String {
+    let license_check = CheckLicenseStatusUseCase::new(
+        Arc::clone(&state.hwid_provider),
+        Arc::clone(&state.storage),
+    );
+    let license_status = license_check.execute().await;
+
+    let raw_user = std::env::var("USERNAME").unwrap_or_else(|_| "USER".into());
+    let mut clean_user: String = raw_user
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if clean_user.is_empty() {
+        clean_user = "USER".to_string();
+    }
+    if clean_user.len() > 10 {
+        clean_user.truncate(10);
+    }
+
+    match license_status {
+        Ok(LicenseStatus::Licensed { customer_name, .. }) => {
+            let mut clean_company: String = customer_name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                .collect::<String>()
+                .to_ascii_uppercase();
+            while clean_company.contains("__") {
+                clean_company = clean_company.replace("__", "_");
+            }
+            clean_company = clean_company.trim_matches('_').to_string();
+            if clean_company.is_empty() {
+                clean_company = "LICENSED".to_string();
+            }
+            if clean_company.len() > 16 {
+                clean_company.truncate(16);
+            }
+            format!("{}-{}", clean_company, clean_user)
+        }
+        _ => {
+            let hwid = state
+                .hwid_provider
+                .get_hardware_id()
+                .await
+                .map(|h| h.to_string())
+                .unwrap_or_else(|_| "T3-0000-0000-XXXX".to_string());
+            let hwid_clean: String = hwid
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect();
+            let suffix = if hwid_clean.len() >= 4 {
+                &hwid_clean[hwid_clean.len() - 4..]
+            } else {
+                "T301"
+            };
+            format!("TRIAL-{}-{}", clean_user, suffix.to_ascii_uppercase())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn get_host_config(state: tauri::State<'_, AppState>) -> Result<UiHostConfig, String> {
+    let code = compute_host_code(&state).await;
+    *state.host_code.lock().await = code.clone();
+
+    let existing = load_host_config().unwrap_or(None);
+    let has_password = existing.map(|c| !c.password_hash.is_empty()).unwrap_or(false);
+
+    Ok(UiHostConfig {
+        host_code: code,
+        has_password,
+    })
+}
+
+#[tauri::command]
+pub async fn set_host_password(
+    password: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiHostConfig, String> {
+    let pwd = password.trim();
+    if pwd.len() < 4 {
+        return Err("Password must be at least 4 characters long.".into());
+    }
+
+    let code = compute_host_code(&state).await;
+    *state.host_code.lock().await = code.clone();
+
+    let salt: String = (0..8)
+        .map(|_| format!("{:x}", rand::random::<u8>() % 16))
+        .collect();
+    let password_hash = hash_password_with_salt(pwd, &salt);
+
+    let config = HostConfig {
+        host_code: code.clone(),
+        password_hash,
+        salt,
+        updated_at: chrono::Utc::now().timestamp(),
+    };
+
+    save_host_config(&config)?;
+
+    Ok(UiHostConfig {
+        host_code: code,
+        has_password: true,
+    })
+}
+
+#[tauri::command]
+pub async fn get_saved_client_credentials() -> Result<ClientConfig, String> {
+    let conf = load_client_config().unwrap_or(None).unwrap_or(ClientConfig {
+        saved_target: "".into(),
+        saved_password: "".into(),
+        remember: false,
+    });
+    Ok(conf)
+}
+
+#[tauri::command]
+pub async fn save_client_credentials(
+    target: String,
+    password: String,
+    remember: bool,
+) -> Result<(), String> {
+    let config = if remember {
+        ClientConfig {
+            saved_target: target.trim().to_string(),
+            saved_password: password.trim().to_string(),
+            remember: true,
+        }
+    } else {
+        ClientConfig {
+            saved_target: "".into(),
+            saved_password: "".into(),
+            remember: false,
+        }
+    };
+    save_client_config(&config)
+}
+
 #[tauri::command]
 pub async fn get_hardware_id(state: tauri::State<'_, AppState>) -> Result<String, String> {
     state
@@ -182,6 +401,7 @@ pub fn get_app_profiles() -> Vec<AppProfile> {
 #[tauri::command]
 pub async fn connect_bridge(
     target_peer_id: String,
+    password: Option<String>,
     app_id: String,
     custom_name: Option<String>,
     custom_share: Option<String>,
@@ -208,7 +428,7 @@ pub async fn connect_bridge(
 
     let host_input = target_peer_id.trim();
     if host_input.is_empty() {
-        return Err("Please enter the Server IP or Connect Code (e.g. 192.168.1.100 or OFFICE-HQ-01).".into());
+        return Err("Please enter the Server IP or Connect Code (e.g. 192.168.1.100 or TRIAL-USER-XXXX).".into());
     }
 
     let letter = drive_letter
@@ -229,17 +449,20 @@ pub async fn connect_bridge(
 
     // Determine target host & peer:
     // Case 0: Self-Hosting / Local Loopback Check
-    // If this computer is currently running in Host Mode and the user inputs this host's code
-    // (e.g. "OFFICE-HQ-01") or "127.0.0.1" or "localhost", connect directly via local SMB loopback!
-    let is_hosting_now = *state.is_hosting.lock().await;
-    let my_code = state.host_code.lock().await.clone();
-    let is_self_host = is_hosting_now && (
-        host_input.eq_ignore_ascii_case(&my_code) ||
+    // If the user inputs this host's code, or "127.0.0.1", or "localhost", connect directly via local SMB loopback!
+    let my_code = compute_host_code(&state).await;
+    let is_self_host = host_input.eq_ignore_ascii_case(&my_code) ||
         host_input.eq_ignore_ascii_case("127.0.0.1") ||
-        host_input.eq_ignore_ascii_case("localhost")
-    );
+        host_input.eq_ignore_ascii_case("localhost");
 
     let target_peer = if is_self_host {
+        let host_conf = load_host_config().ok().flatten().filter(|c| !c.password_hash.is_empty());
+        if let Some(c) = host_conf {
+            let incoming = password.as_deref().unwrap_or("").trim();
+            if hash_password_with_salt(incoming, &c.salt) != c.password_hash {
+                return Err("Authentication Failed: Incorrect Host Access Password".into());
+            }
+        }
         let virtual_ip = VirtualIp::new("127.0.0.1", 24).map_err(|e| e.to_string())?;
         Peer::new(
             "127.0.0.1".into(),
@@ -340,8 +563,9 @@ pub async fn connect_bridge(
                 format!("Failed to start virtual network adapter: {}\nMake sure t3Bridge is running as Administrator.", e)
             })?;
 
-            // Send RelayRequest to signaling server
-            let session_id = format!("sess_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+            // Send RelayRequest to signaling server with authentication token
+            let clean_pwd = password.unwrap_or_default().trim().to_string();
+            let session_id = format!("sess_{}::AUTH_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), clean_pwd);
             let _ = client.send_message(SignalingMessage::RelayRequest {
                 target_peer_id: clean_code.clone(),
                 session_id: session_id.clone(),
@@ -430,6 +654,7 @@ pub struct PeerConnectionInfo {
 #[tauri::command]
 pub async fn connect_peer_only(
     target_peer_id: String,
+    password: Option<String>,
     signaling_url: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<PeerConnectionInfo, String> {
@@ -452,15 +677,19 @@ pub async fn connect_peer_only(
         .unwrap_or_else(|| "wss://t3bridge-signaling.onrender.com".to_string());
 
     // Reuse same peer resolution logic as connect_bridge
-    let is_hosting_now = *state.is_hosting.lock().await;
-    let my_code = state.host_code.lock().await.clone();
-    let is_self_host = is_hosting_now && (
-        host_input.eq_ignore_ascii_case(&my_code) ||
+    let my_code = compute_host_code(&state).await;
+    let is_self_host = host_input.eq_ignore_ascii_case(&my_code) ||
         host_input.eq_ignore_ascii_case("127.0.0.1") ||
-        host_input.eq_ignore_ascii_case("localhost")
-    );
+        host_input.eq_ignore_ascii_case("localhost");
 
     let (target_peer, server_ip, is_wan) = if is_self_host {
+        let host_conf = load_host_config().ok().flatten().filter(|c| !c.password_hash.is_empty());
+        if let Some(c) = host_conf {
+            let incoming = password.as_deref().unwrap_or("").trim();
+            if hash_password_with_salt(incoming, &c.salt) != c.password_hash {
+                return Err("Authentication Failed: Incorrect Host Access Password".into());
+            }
+        }
         let vip = VirtualIp::new("127.0.0.1", 24).map_err(|e| e.to_string())?;
         let peer = Peer::new("127.0.0.1".into(), "Local Host Server (Loopback)".into(), PeerRole::HostServer, vip);
         (peer, "127.0.0.1".to_string(), false)
@@ -512,17 +741,13 @@ pub async fn connect_peer_only(
 
             state.tunnel.start_adapter(client_vip).await.map_err(|e| format!("Tunnel start failed: {}", e))?;
 
-            let session_id = format!("sess_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-            let _ = client.send_message(SignalingMessage::RelayRequest {
-                target_peer_id: clean_code.clone(),
-                session_id: session_id.clone(),
-            }).await;
+            let clean_pwd = password.unwrap_or_default().trim().to_string();
 
-            // Also query server shares via HolePunchOffer (existing Render routed message)
+            // Step 1: Authenticate & query server shares via HolePunchOffer (never embed password in RelayData session_id)
             let query_offer = t3_domain::HolePunchPayload {
                 peer_id: client_node_id.clone(),
                 public_endpoint: "0.0.0.0:0".into(),
-                wireguard_pubkey: "QUERY_SHARES".into(),
+                wireguard_pubkey: format!("AUTH:{}::QUERY_SHARES", clean_pwd),
                 local_candidate: None,
             };
             let _ = client.send_message(SignalingMessage::HolePunchOffer {
@@ -530,30 +755,40 @@ pub async fn connect_peer_only(
                 offer: query_offer,
             }).await;
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
+            // auth_tx carries Ok(session_id) on success or Err(reason) on auth failure
+            let (auth_tx, mut auth_rx) = tokio::sync::mpsc::channel::<Result<String, String>>(1);
+            let auth_tx_clone = auth_tx.clone();
+            let clean_pwd_fallback = clean_pwd.clone();
 
             let inbound_rx = client.take_inbound_receiver().await;
             let tunnel_for_client = Arc::clone(&state.tunnel);
             let client_sender = client.get_sender().await;
             let discovered_shares_ref = Arc::clone(&state.discovered_shares);
 
-            if let (Some(mut rx), Some(tx)) = (inbound_rx, client_sender) {
-                let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                tunnel_for_client.set_outbound_channel(out_tx);
-                let sess_clone = session_id.clone();
-                tokio::spawn(async move {
-                    while let Some(packet) = out_rx.recv().await {
-                        let _ = tx.send(SignalingMessage::RelayData { session_id: sess_clone.clone(), chunk: packet });
-                    }
-                });
+            if let Some(mut rx) = inbound_rx {
+                let tunnel_for_rx = Arc::clone(&tunnel_for_client);
                 tokio::spawn(async move {
                     while let Some(msg) = rx.recv().await {
                         match msg {
                             SignalingMessage::RelayData { chunk, .. } => {
-                                let _ = tunnel_for_client.inject_inbound_packet(&chunk);
+                                let _ = tunnel_for_rx.inject_inbound_packet(&chunk);
                             }
                             SignalingMessage::HolePunchAnswer { answer, .. } => {
-                                if answer.wireguard_pubkey.starts_with("SHARES:") {
+                                if answer.wireguard_pubkey.starts_with("AUTH_FAILED:") {
+                                    let err_msg = answer.wireguard_pubkey.trim_start_matches("AUTH_FAILED:").to_string();
+                                    let _ = auth_tx_clone.send(Err(err_msg)).await;
+                                } else if let Some(rest) = answer.wireguard_pubkey.strip_prefix("TOKEN:") {
+                                    if let Some((tok, shares_part)) = rest.split_once("::SHARES:") {
+                                        let parsed: Vec<String> = shares_part
+                                            .split(',')
+                                            .map(|s| s.trim().to_string())
+                                            .filter(|s| !s.is_empty())
+                                            .collect();
+                                        *discovered_shares_ref.lock().await = parsed;
+                                        let _ = auth_tx_clone.send(Ok(format!("sess_tok_{}", tok.trim()))).await;
+                                    }
+                                } else if answer.wireguard_pubkey.starts_with("SHARES:") {
+                                    // Backwards compatibility with older host versions
                                     let csv = answer.wireguard_pubkey.trim_start_matches("SHARES:");
                                     let parsed: Vec<String> = csv
                                         .split(',')
@@ -561,11 +796,55 @@ pub async fn connect_peer_only(
                                         .filter(|s| !s.is_empty())
                                         .collect();
                                     *discovered_shares_ref.lock().await = parsed;
+                                    let legacy_sid = format!(
+                                        "sess_{}::AUTH_{}",
+                                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                                        clean_pwd_fallback
+                                    );
+                                    let _ = auth_tx_clone.send(Ok(legacy_sid)).await;
                                 }
                             }
-                            SignalingMessage::RelayClose { .. } => break,
+                            SignalingMessage::RelayClose { .. } => {
+                                let _ = auth_tx_clone.send(Err("Incorrect Host Access Password".to_string())).await;
+                                break;
+                            }
                             _ => {}
                         }
+                    }
+                });
+            }
+
+            // Await authentication & opaque session token from host (timeout 5000ms for mobile/WAN latency)
+            let session_id = match tokio::time::timeout(tokio::time::Duration::from_millis(5000), auth_rx.recv()).await {
+                Ok(Some(Ok(sid))) => sid,
+                Ok(Some(Err(e))) => {
+                    let _ = client.disconnect().await;
+                    let _ = state.tunnel.disconnect().await;
+                    return Err(format!("Authentication Failed: {}", e));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = client.disconnect().await;
+                    let _ = state.tunnel.disconnect().await;
+                    return Err(format!(
+                        "Host '{}' did not respond.\n\nPlease check:\n1. On Server PC: Ensure Host Mode is active (shows 'Broadcasting on Cloud Mesh').\n2. Verify the Host Access Password.",
+                        clean_code
+                    ));
+                }
+            };
+
+            // Step 2: Open WAN Relay using the clean opaque session_id (no password in RelayData)
+            let _ = client.send_message(SignalingMessage::RelayRequest {
+                target_peer_id: clean_code.clone(),
+                session_id: session_id.clone(),
+            }).await;
+
+            if let Some(tx) = client_sender {
+                let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                tunnel_for_client.set_outbound_channel(out_tx);
+                let sess_clone = session_id.clone();
+                tokio::spawn(async move {
+                    while let Some(packet) = out_rx.recv().await {
+                        let _ = tx.send(SignalingMessage::RelayData { session_id: sess_clone.clone(), chunk: packet });
                     }
                 });
             }
@@ -617,12 +896,7 @@ pub async fn list_server_shares(
     }
 
     // Direct network scan via net view
-    let mut shares = state.system.list_remote_shares(&server_ip).await.unwrap_or_default();
-
-    if shares.is_empty() && is_wan {
-        // Fallback default suggestions for WAN so user can 1-click select
-        shares = vec!["python".into(), "MargERP".into(), "SharedData".into()];
-    }
+    let shares = state.system.list_remote_shares(&server_ip).await.unwrap_or_default();
 
     Ok(shares)
 }
@@ -660,17 +934,25 @@ pub async fn mount_selected_share(
 
 #[tauri::command]
 pub async fn start_host_mode(
-    connect_code: String,
+    _connect_code: Option<String>,
     signaling_url: Option<String>,
     share_folder_path: Option<String>,
     share_name: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<UiHostStatus, String> {
-    let code = if connect_code.trim().is_empty() {
-        "OFFICE-HQ-01".to_string()
-    } else {
-        connect_code.trim().to_uppercase()
-    };
+    // 1. Enforce that host password must be configured
+    let host_conf = load_host_config()
+        .ok()
+        .flatten()
+        .filter(|c| !c.password_hash.is_empty());
+
+    if host_conf.is_none() {
+        return Err("Please set a Host Access Password before starting Host Server Mode.".into());
+    }
+
+    // 2. Automatically compute unique host code by policy
+    let code = compute_host_code(&state).await;
+    *state.host_code.lock().await = code.clone();
 
     let url = signaling_url
         .filter(|u| !u.trim().is_empty())
@@ -808,10 +1090,33 @@ pub async fn start_host_mode(
                 }
             });
 
+            // One-time authorized session tokens issued after password verification
+            let mut authorized_tokens = std::collections::HashSet::<String>::new();
+
             // Pump inbound signaling messages
             while let Some(msg) = rx.recv().await {
                 match msg {
                     SignalingMessage::RelayRequest { target_peer_id: _, session_id } => {
+                        let is_authenticated = if let Some(tok) = session_id.strip_prefix("sess_tok_") {
+                            authorized_tokens.remove(tok)
+                        } else {
+                            // Backwards compatibility with legacy ::AUTH_ format
+                            let incoming_pwd = session_id
+                                .split_once("::AUTH_")
+                                .map(|(_, pwd)| pwd)
+                                .unwrap_or("");
+                            let host_conf = load_host_config().ok().flatten().filter(|c| !c.password_hash.is_empty());
+                            match &host_conf {
+                                Some(c) => hash_password_with_salt(incoming_pwd, &c.salt) == c.password_hash,
+                                None => true,
+                            }
+                        };
+
+                        if !is_authenticated {
+                            let _ = tx.send(SignalingMessage::RelayClose { session_id });
+                            continue;
+                        }
+
                         let mut clients = host_clients.lock().await;
                         if clients.len() as u32 >= allowed_nodes && !clients.contains(&session_id) {
                             let _ = tx.send(SignalingMessage::Error {
@@ -831,7 +1136,39 @@ pub async fn start_host_mode(
                         }
                     }
                     SignalingMessage::HolePunchOffer { target_peer_id: _, offer } => {
-                        // Client is requesting server share list
+                        // Client is requesting server share list with password authentication
+                        let incoming_pwd = if let Some(stripped) = offer.wireguard_pubkey.strip_prefix("AUTH:") {
+                            stripped.split_once("::").map(|(p, _)| p).unwrap_or(stripped)
+                        } else {
+                            ""
+                        };
+
+                        let host_conf = load_host_config().ok().flatten().filter(|c| !c.password_hash.is_empty());
+                        let is_authenticated = match &host_conf {
+                            Some(c) => hash_password_with_salt(incoming_pwd, &c.salt) == c.password_hash,
+                            None => true,
+                        };
+
+                        if !is_authenticated {
+                            let answer = t3_domain::HolePunchPayload {
+                                peer_id: host_code_for_pump.clone(),
+                                public_endpoint: "0.0.0.0:0".into(),
+                                wireguard_pubkey: "AUTH_FAILED:Incorrect Host Access Password".into(),
+                                local_candidate: None,
+                            };
+                            let _ = tx.send(SignalingMessage::HolePunchAnswer {
+                                target_peer_id: offer.peer_id,
+                                answer,
+                            });
+                            continue;
+                        }
+
+                        // Issue one-time opaque session token so RelayData never carries plaintext password
+                        let token: String = (0..8)
+                            .map(|_| format!("{:02x}", rand::random::<u8>()))
+                            .collect();
+                        authorized_tokens.insert(token.clone());
+
                         let mut local_shares = system_for_host.list_local_shares().await.unwrap_or_default();
                         if !share_for_pump.is_empty() && !local_shares.contains(&share_for_pump) {
                             local_shares.insert(0, share_for_pump.clone());
@@ -840,7 +1177,7 @@ pub async fn start_host_mode(
                         let answer = t3_domain::HolePunchPayload {
                             peer_id: host_code_for_pump.clone(),
                             public_endpoint: "0.0.0.0:0".into(),
-                            wireguard_pubkey: format!("SHARES:{}", shares_csv),
+                            wireguard_pubkey: format!("TOKEN:{}::SHARES:{}", token, shares_csv),
                             local_candidate: None,
                         };
                         let _ = tx.send(SignalingMessage::HolePunchAnswer {
@@ -1065,7 +1402,7 @@ pub fn init_app_state() -> AppState {
         host_signaling: Mutex::new(None),
         client_signaling: Mutex::new(None),
         is_hosting: Mutex::new(false),
-        host_code: Mutex::new("OFFICE-HQ-01".into()),
+        host_code: Mutex::new("HOST-PENDING".into()),
         host_status_message: Mutex::new("Offline".into()),
         active_server_ip: Mutex::new(None),
         host_share_name: Mutex::new("SharedData".into()),
@@ -1094,4 +1431,49 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_password_hashing_and_verification() {
+        let password = "SuperSecretPassword123";
+        let salt = "a1b2c3d4";
+        let hash1 = hash_password_with_salt(password, salt);
+        let hash2 = hash_password_with_salt(password, salt);
+        assert_eq!(hash1, hash2);
+
+        let wrong_hash = hash_password_with_salt("WrongPassword", salt);
+        assert_ne!(hash1, wrong_hash);
+    }
+
+    #[test]
+    fn test_host_config_serialization() {
+        let config = HostConfig {
+            host_code: "TRIAL-ADMIN-4A2F".into(),
+            password_hash: "abcd1234ef567890".into(),
+            salt: "salt1234".into(),
+            updated_at: 1732283000,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: HostConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.host_code, "TRIAL-ADMIN-4A2F");
+        assert_eq!(deserialized.password_hash, "abcd1234ef567890");
+    }
+
+    #[test]
+    fn test_client_config_serialization() {
+        let config = ClientConfig {
+            saved_target: "TRIAL-ADMIN-4A2F".into(),
+            saved_password: "mysecret".into(),
+            remember: true,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: ClientConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.saved_target, "TRIAL-ADMIN-4A2F");
+        assert_eq!(deserialized.saved_password, "mysecret");
+        assert!(deserialized.remember);
+    }
 }

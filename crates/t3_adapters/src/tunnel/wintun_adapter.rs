@@ -175,6 +175,14 @@ impl TunnelPort for WintunTunnelAdapter {
             .args(["interface", "ipv4", "set", "interface", "name=t3Bridge", "metric=1"])
             .output();
 
+        // Limit MTU so TCP segments stay small enough to survive the WebSocket relay
+        let mut mtu_cmd = Command::new("netsh");
+        #[cfg(windows)]
+        mtu_cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = mtu_cmd
+            .args(["interface", "ipv4", "set", "subinterface", "t3Bridge", "mtu=1280", "store=active"])
+            .output();
+
         // Enable Insecure Guest Auth & Linked Connections in Windows Registry
         let mut reg_cmd1 = Command::new("reg");
         #[cfg(windows)]

@@ -161,7 +161,7 @@ impl WindowsSystemPort for WindowsSystemAdapter {
             cmd.creation_flags(CREATE_NO_WINDOW);
             cmd.stdin(std::process::Stdio::null());
             cmd.args(args);
-            tokio::time::timeout(tokio::time::Duration::from_secs(18), cmd.output()).await
+            tokio::time::timeout(tokio::time::Duration::from_secs(75), cmd.output()).await
         };
 
         let output = run_cmd(vec![
@@ -178,20 +178,23 @@ impl WindowsSystemPort for WindowsSystemAdapter {
         };
 
         if !success {
-            // 5. Fallback with anonymous / Guest credentials if direct mount failed
-            let fallback_output = run_cmd(vec![
-                "use".into(),
-                drive_spec.clone(),
-                unc_path.to_string(),
-                r#""""#.into(),
-                "/user:Guest".into(),
-                "/persistent:no".into(),
-                "/y".into(),
-            ]).await;
+            // Only retry with Guest credentials if the first attempt returned an error
+            // (not when it timed out — a second long wait would just double the delay).
+            if matches!(output, Ok(Ok(_))) {
+                let fallback_output = run_cmd(vec![
+                    "use".into(),
+                    drive_spec.clone(),
+                    unc_path.to_string(),
+                    r#""""#.into(),
+                    "/user:Guest".into(),
+                    "/persistent:no".into(),
+                    "/y".into(),
+                ]).await;
 
-            if let Ok(Ok(fb)) = fallback_output {
-                if fb.status.success() {
-                    return Ok(());
+                if let Ok(Ok(fb)) = fallback_output {
+                    if fb.status.success() {
+                        return Ok(());
+                    }
                 }
             }
 
@@ -200,7 +203,7 @@ impl WindowsSystemPort for WindowsSystemAdapter {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 format!("{} {}", stdout.trim(), stderr.trim())
             } else {
-                "Connection timed out. Server or SMB port unreachable.".to_string()
+                "Connection timed out waiting for the SMB handshake over the relay.".to_string()
             };
 
             return Err(DomainError::NetworkFailure(format!(
