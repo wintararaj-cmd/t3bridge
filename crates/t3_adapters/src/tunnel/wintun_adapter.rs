@@ -1,8 +1,10 @@
 use crate::nat::StunClientAdapter;
 use crate::tunnel::packet_filter::{clamp_tcp_mss, extract_routable_ipv4_dst};
 use crate::tunnel::wireguard_peer::{WgPeerSession, WireGuardKeypair};
+use crate::windows_sys::WindowsSystemAdapter;
 use async_trait::async_trait;
 use rand::RngCore;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -30,8 +32,49 @@ const WIREGUARD_TUNNEL_MTU: &str = "mtu=1380";
 const WIREGUARD_TCP_MSS: u16 = 1340;
 /// NAT hole-punch probe marker (ignored by boringtun receive path)
 const HOLE_PUNCH_PROBE: &[u8] = b"\x00\x00t3Bridge_PUNCH\x00";
+/// Desired UDP socket receive/send buffer size (4 MB) to absorb SMB/DBF burst traffic without OS drops
+const UDP_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const UDP_SOCKET_BUFFER_FALLBACK_BYTES: usize = 1024 * 1024;
 
 const STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun1.l.google.com:19302"];
+
+/// Creates an IPv4 UDP socket with enlarged OS receive/send buffers (4 MB, falling back to 1 MB)
+/// so high-burst SMB/DBF traffic over WireGuard P2P does not overflow Windows' 64 KB default buffer.
+fn bind_tuned_udp_socket() -> std::io::Result<UdpSocket> {
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    if sock.set_recv_buffer_size(UDP_SOCKET_BUFFER_BYTES).is_err() {
+        let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER_FALLBACK_BYTES);
+    }
+    if sock.set_send_buffer_size(UDP_SOCKET_BUFFER_BYTES).is_err() {
+        let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER_FALLBACK_BYTES);
+    }
+    let bind_addr: SocketAddr = "0.0.0.0:0".parse().expect("valid IPv4 bind address");
+    sock.bind(&bind_addr.into())?;
+    sock.set_nonblocking(true)?;
+    let std_udp: std::net::UdpSocket = sock.into();
+    UdpSocket::from_std(std_udp)
+}
+
+/// Returns `true` for transient UDP `recv_from` errors that must NOT kill the P2P receiver loop.
+///
+/// Critical on Windows: sending a hole-punch probe to an unreachable LAN/NAT candidate triggers
+/// an ICMP Port Unreachable reply which Winsock surfaces on the next `recv_from()` as
+/// `WSAECONNRESET` (OS error 10054). Breaking on that error previously terminated Direct UDP P2P!
+fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::TimedOut
+    ) || matches!(
+        err.raw_os_error(),
+        Some(10054) // WSAECONNRESET (ICMP Port Unreachable on Windows)
+            | Some(10040) // WSAEMSGSIZE (oversized datagram)
+            | Some(10051) // WSAENETUNREACH
+            | Some(10065) // WSAEHOSTUNREACH
+    )
+}
 
 type PeerMap = HashMap<Ipv4Addr, Arc<std::sync::Mutex<WgPeerSession>>>;
 
@@ -127,7 +170,7 @@ impl WintunTunnelAdapter {
     pub async fn init_p2p_udp(&self) -> (String, Option<String>) {
         let gen = self.p2p_gen.fetch_add(1, Ordering::SeqCst) + 1;
 
-        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+        let sock = match bind_tuned_udp_socket() {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 eprintln!("[t3_tunnel] Failed to bind P2P UDP socket: {}", e);
@@ -175,6 +218,7 @@ impl WintunTunnelAdapter {
                 let recv = timeout(Duration::from_secs(2), sock_rx.recv_from(&mut buf)).await;
                 let (len, src) = match recv {
                     Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) if is_transient_udp_recv_error(&e) => continue,
                     Ok(Err(_)) => break,
                     Err(_) => continue,
                 };
@@ -579,10 +623,25 @@ impl TunnelPort for WintunTunnelAdapter {
             DomainError::NetworkFailure(format!("Failed to start Wintun session: {}", e))
         })?;
 
-        // Configure adapter IPv4 address via netsh (with PowerShell fallback) and verify assignment
-        let ip_str = local_ip.addr().to_string();
+        // Resolve the ACTUAL Windows interface alias and numeric Win32 InterfaceIndex.
+        // Windows may auto-rename the adapter (e.g. "t3Bridge 2") if a ghost/stale adapter exists,
+        // so using InterfaceIndex / actual alias prevents netsh & PowerShell from targeting the wrong adapter.
+        let adapter_name = adapter
+            .get_name()
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "t3Bridge".to_string());
+        let adapter_index = adapter.get_adapter_index().ok();
+        let netsh_target = adapter_index
+            .map(|idx| idx.to_string())
+            .unwrap_or_else(|| adapter_name.clone());
+        let netsh_name_arg = format!("name={}", netsh_target);
+
+        // Configure adapter IPv4 address via netsh (with PowerShell fallback) and verify via Win32 IP Helper API
+        let target_v4 = *local_ip.addr();
+        let ip_str = target_v4.to_string();
         let mut ip_assigned = false;
-        for attempt in 0..15 {
+        for attempt in 0..20 {
             let mut cmd = Command::new("netsh");
             #[cfg(windows)]
             cmd.creation_flags(CREATE_NO_WINDOW);
@@ -592,18 +651,27 @@ impl TunnelPort for WintunTunnelAdapter {
                     "ipv4",
                     "set",
                     "address",
-                    "name=t3Bridge",
+                    &netsh_name_arg,
                     "static",
                     &ip_str,
                     "255.255.255.0",
                 ])
                 .output();
 
+            // 1. Primary verification: direct Win32 GetAdaptersAddresses by GUID (immune to alias/locale)
+            if let Ok(addrs) = adapter.get_addresses() {
+                if addrs.iter().any(|a| *a == std::net::IpAddr::V4(target_v4)) {
+                    ip_assigned = true;
+                    break;
+                }
+            }
+
+            // 2. Secondary verification via netsh show addresses
             let mut verify_cmd = Command::new("netsh");
             #[cfg(windows)]
             verify_cmd.creation_flags(CREATE_NO_WINDOW);
             if let Ok(out) = verify_cmd
-                .args(["interface", "ipv4", "show", "addresses", "t3Bridge"])
+                .args(["interface", "ipv4", "show", "addresses", &netsh_target])
                 .output()
             {
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -613,17 +681,32 @@ impl TunnelPort for WintunTunnelAdapter {
                 }
             }
 
-            if attempt == 4 || attempt == 9 {
+            if attempt == 2 || attempt == 7 || attempt == 13 {
                 let mut ps_ip_cmd = Command::new("powershell");
                 #[cfg(windows)]
                 ps_ip_cmd.creation_flags(CREATE_NO_WINDOW);
-                let ps_script = format!(
-                    "Get-NetIPAddress -InterfaceAlias 't3Bridge' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; New-NetIPAddress -InterfaceAlias 't3Bridge' -IPAddress '{}' -PrefixLength 24 -ErrorAction SilentlyContinue | Out-Null",
-                    ip_str
-                );
+                let escaped_alias = adapter_name.replace('\'', "''");
+                let ps_script = if let Some(idx) = adapter_index {
+                    format!(
+                        "Get-NetIPAddress -InterfaceIndex {} -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; New-NetIPAddress -InterfaceIndex {} -IPAddress '{}' -PrefixLength 24 -ErrorAction SilentlyContinue | Out-Null",
+                        idx, idx, ip_str
+                    )
+                } else {
+                    format!(
+                        "Get-NetIPAddress -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; New-NetIPAddress -InterfaceAlias '{}' -IPAddress '{}' -PrefixLength 24 -ErrorAction SilentlyContinue | Out-Null",
+                        escaped_alias, escaped_alias, ip_str
+                    )
+                };
                 let _ = ps_ip_cmd
                     .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
                     .output();
+
+                if let Ok(addrs) = adapter.get_addresses() {
+                    if addrs.iter().any(|a| *a == std::net::IpAddr::V4(target_v4)) {
+                        ip_assigned = true;
+                        break;
+                    }
+                }
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
@@ -632,8 +715,8 @@ impl TunnelPort for WintunTunnelAdapter {
         if !ip_assigned {
             let _ = session.shutdown();
             return Err(DomainError::NetworkFailure(format!(
-                "Failed to assign virtual IP '{}' to t3Bridge network adapter. Please ensure t3Bridge is running as Administrator or Windows Service.",
-                ip_str
+                "Failed to assign virtual IP '{}' to t3Bridge network adapter (alias='{}', index={:?}). Please ensure t3Bridge is running as Administrator or Windows Service.",
+                ip_str, adapter_name, adapter_index
             )));
         }
 
@@ -642,7 +725,7 @@ impl TunnelPort for WintunTunnelAdapter {
         #[cfg(windows)]
         if_cmd.creation_flags(CREATE_NO_WINDOW);
         let _ = if_cmd
-            .args(["interface", "ipv4", "set", "interface", "name=t3Bridge", "metric=1"])
+            .args(["interface", "ipv4", "set", "interface", &netsh_name_arg, "metric=1"])
             .output();
 
         // Optimize MTU for WireGuard UDP P2P (1380 leaves clean room for IPv4+UDP+WG headers)
@@ -655,46 +738,15 @@ impl TunnelPort for WintunTunnelAdapter {
                 "ipv4",
                 "set",
                 "subinterface",
-                "t3Bridge",
+                &netsh_target,
                 WIREGUARD_TUNNEL_MTU,
                 "store=active",
             ])
             .output();
 
-        // Enable Insecure Guest Auth & Linked Connections in Windows Registry
-        let mut reg_cmd1 = Command::new("reg");
-        #[cfg(windows)]
-        reg_cmd1.creation_flags(CREATE_NO_WINDOW);
-        let _ = reg_cmd1
-            .args([
-                "add",
-                r"HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters",
-                "/v",
-                "EnableInsecureGuestAuth",
-                "/t",
-                "REG_DWORD",
-                "/d",
-                "1",
-                "/f",
-            ])
-            .output();
-
-        let mut reg_cmd1b = Command::new("reg");
-        #[cfg(windows)]
-        reg_cmd1b.creation_flags(CREATE_NO_WINDOW);
-        let _ = reg_cmd1b
-            .args([
-                "add",
-                r"HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters",
-                "/v",
-                "AllowInsecureGuestAuth",
-                "/t",
-                "REG_DWORD",
-                "/d",
-                "1",
-                "/f",
-            ])
-            .output();
+        // Apply SMB Client WAN & DBF/ERP Registry Tuning (Guest Auth, DisableBandwidthThrottling,
+        // DisableLargeMtu=0, metadata cache capacities, MaxCmds) while running under elevated/SYSTEM context
+        WindowsSystemAdapter::apply_smb_client_wan_tuning();
 
         let mut reg_cmd2 = Command::new("reg");
         #[cfg(windows)]
@@ -714,16 +766,22 @@ impl TunnelPort for WintunTunnelAdapter {
             .output();
 
         // Configure network connection profile to Private so Windows enables File & Printer Sharing (SMB)
+        let profile_ps = if let Some(idx) = adapter_index {
+            format!(
+                "Set-NetConnectionProfile -InterfaceIndex {} -NetworkCategory Private -ErrorAction SilentlyContinue",
+                idx
+            )
+        } else {
+            format!(
+                "Set-NetConnectionProfile -InterfaceAlias '{}' -NetworkCategory Private -ErrorAction SilentlyContinue",
+                adapter_name.replace('\'', "''")
+            )
+        };
         let mut ps_cmd = Command::new("powershell");
         #[cfg(windows)]
         ps_cmd.creation_flags(CREATE_NO_WINDOW);
         let _ = ps_cmd
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Set-NetConnectionProfile -InterfaceAlias 't3Bridge' -NetworkCategory Private -ErrorAction SilentlyContinue",
-            ])
+            .args(["-NoProfile", "-NonInteractive", "-Command", &profile_ps])
             .output();
 
         self.is_active.store(true, Ordering::SeqCst);
@@ -841,7 +899,7 @@ impl TunnelPort for WintunTunnelAdapter {
     async fn connect_peer(&self, peer: &Peer, remote_endpoint: &str) -> DomainResult<()> {
         if let Ok(addr) = remote_endpoint.parse::<SocketAddr>() {
             if addr.port() > 0 && !addr.ip().is_unspecified() {
-                if let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await {
+                if let Ok(sock) = bind_tuned_udp_socket() {
                     let _ = sock.connect(addr).await;
                     *self.udp_socket.lock().await = Some(Arc::new(sock));
                 }
@@ -893,5 +951,44 @@ impl TunnelPort for WintunTunnelAdapter {
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             packet_loss_percent: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_bind_tuned_udp_socket_binds_and_enlarges_buffers() {
+        let sock = bind_tuned_udp_socket().expect("tuned UDP socket should bind");
+        assert!(sock.local_addr().unwrap().port() > 0);
+        let sock_ref = socket2::SockRef::from(&sock);
+        let rcv_buf = sock_ref.recv_buffer_size().unwrap_or(0);
+        let snd_buf = sock_ref.send_buffer_size().unwrap_or(0);
+        assert!(
+            rcv_buf >= 256 * 1024,
+            "Expected enlarged UDP recv buffer, got {} bytes",
+            rcv_buf
+        );
+        assert!(
+            snd_buf >= 256 * 1024,
+            "Expected enlarged UDP send buffer, got {} bytes",
+            snd_buf
+        );
+    }
+
+    #[test]
+    fn test_transient_udp_recv_error_ignores_windows_wsaeconnreset() {
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "WSAECONNRESET");
+        assert!(is_transient_udp_recv_error(&reset));
+
+        let os_10054 = std::io::Error::from_raw_os_error(10054);
+        assert!(is_transient_udp_recv_error(&os_10054));
+
+        let os_10040 = std::io::Error::from_raw_os_error(10040);
+        assert!(is_transient_udp_recv_error(&os_10040));
+
+        let fatal = std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad fd");
+        assert!(!is_transient_udp_recv_error(&fatal));
     }
 }

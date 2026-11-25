@@ -46,6 +46,7 @@ const targetPeerId = document.getElementById('targetPeerId');
 const driveLetter = document.getElementById('driveLetter');
 const headerStatusBadge = document.getElementById('headerStatusBadge');
 const statusText = document.getElementById('statusText');
+const metricTransport = document.getElementById('metricTransport');
 const metricLatency = document.getElementById('metricLatency');
 const metricHealth = document.getElementById('metricHealth');
 const metricIp = document.getElementById('metricIp');
@@ -556,6 +557,21 @@ if (btnGoToLicense) {
   });
 }
 
+function formatTransportDisplay(modeCode, fallbackLabel) {
+  switch (modeCode) {
+    case 'direct_udp_p2p':
+      return { short: '⚡ Direct UDP P2P', cls: 'transport-p2p', badgeCls: 'badge-success', anim: '✓ CONNECTED • DIRECT UDP P2P' };
+    case 'lan_direct':
+      return { short: '🏠 LAN Direct', cls: 'transport-p2p', badgeCls: 'badge-success', anim: '✓ CONNECTED • LAN DIRECT' };
+    case 'ws_binary_relay':
+      return { short: '☁️ Cloud Relay (WS)', cls: 'transport-relay', badgeCls: 'badge-warning', anim: '✓ CONNECTED • CLOUD RELAY (BINARY WS)' };
+    case 'ws_legacy_relay':
+      return { short: '☁️ Legacy Relay', cls: 'transport-legacy', badgeCls: 'badge-warning', anim: '✓ CONNECTED • CLOUD RELAY (LEGACY)' };
+    default:
+      return { short: fallbackLabel || '--', cls: 'transport-idle', badgeCls: 'badge-secondary', anim: '✓ CONNECTION ESTABLISHED' };
+  }
+}
+
 function updateUiStatus(status) {
   const connected = status.is_connected;
   const dot = headerStatusBadge.querySelector('.status-dot');
@@ -570,6 +586,12 @@ function updateUiStatus(status) {
       btnOpenFolder.style.display = "inline-block";
       btnOpenFolder.textContent = `📂 Open Folder (${status.drive_letter || 'Z'}:)`;
     }
+    const transport = formatTransportDisplay(status.transport_mode, status.transport_mode_label);
+    if (metricTransport) {
+      metricTransport.textContent = transport.short;
+      metricTransport.title = status.transport_mode_label || transport.short;
+      metricTransport.className = `metric-value ${transport.cls}`;
+    }
     metricLatency.textContent = `${status.latency_ms} ms`;
     metricIp.textContent = status.target_ip || "10.99.0.1";
     metricPath.textContent = status.mapped_unc || `${status.drive_letter || 'Z'}:`;
@@ -583,6 +605,9 @@ function updateUiStatus(status) {
     // Sync animation to connected state
     if (!connAnimPanel.classList.contains('connected')) {
       setAnimationConnected();
+    }
+    if (connStatusText) {
+      connStatusText.textContent = transport.anim;
     }
 
     if (status.alert_message) {
@@ -604,6 +629,11 @@ function updateUiStatus(status) {
     btnConnect.style.display = "inline-block";
     btnDisconnect.style.display = "none";
     if (btnOpenFolder) btnOpenFolder.style.display = "none";
+    if (metricTransport) {
+      metricTransport.textContent = "--";
+      metricTransport.title = "Disconnected";
+      metricTransport.className = "metric-value transport-idle";
+    }
     metricLatency.textContent = "-- ms";
     metricHealth.textContent = "--";
     metricIp.textContent = "--";
@@ -766,6 +796,7 @@ const updateNotes = document.getElementById('updateNotes');
 const btnDownloadUpdate = document.getElementById('btnDownloadUpdate');
 const btnDismissUpdate = document.getElementById('btnDismissUpdate');
 const hostActiveNodesBadge = document.getElementById('hostActiveNodesBadge');
+const hostTransportBadge = document.getElementById('hostTransportBadge');
 
 let latestDownloadUrl = 'https://github.com/t3bridge/t3SharePlus/releases/latest';
 
@@ -998,12 +1029,26 @@ async function loadHostStatus() {
           hostActiveNodesBadge.textContent = `${act} / ${max} Nodes Connected`;
           hostActiveNodesBadge.className = act >= max ? "badge-secondary" : "badge-success";
         }
+        if (hostTransportBadge) {
+          if ((status.active_nodes || 0) > 0 && status.transport_mode && status.transport_mode !== 'disconnected') {
+            const ht = formatTransportDisplay(status.transport_mode, status.transport_mode_label);
+            hostTransportBadge.textContent = ht.short;
+            hostTransportBadge.className = ht.badgeCls;
+          } else {
+            hostTransportBadge.textContent = "Waiting for Branch Peer";
+            hostTransportBadge.className = "badge-secondary";
+          }
+        }
       } else {
         hostStatusBadge.textContent = "Offline (Toggle to Start)";
         hostStatusBadge.className = "badge-secondary";
         if (hostActiveNodesBadge) {
           hostActiveNodesBadge.textContent = "0 / 3 Nodes (Offline)";
           hostActiveNodesBadge.className = "badge-secondary";
+        }
+        if (hostTransportBadge) {
+          hostTransportBadge.textContent = "Idle (Offline)";
+          hostTransportBadge.className = "badge-secondary";
         }
       }
     }

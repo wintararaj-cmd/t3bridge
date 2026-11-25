@@ -1,5 +1,6 @@
 use crate::registry::PeerRegistry;
 use futures_util::{SinkExt, StreamExt};
+use socket2::SockRef;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use t3_domain::SignalingMessage;
@@ -7,7 +8,18 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+const RELAY_TCP_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const RELAY_SEND_BATCH_MAX: usize = 64;
+
 pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry: Arc<PeerRegistry>) {
+    // Low-latency socket tuning: disable Nagle's algorithm & enlarge buffers for SMB/DBF relay bursts
+    let _ = raw_stream.set_nodelay(true);
+    {
+        let sock_ref = SockRef::from(&raw_stream);
+        let _ = sock_ref.set_recv_buffer_size(RELAY_TCP_BUFFER_BYTES);
+        let _ = sock_ref.set_send_buffer_size(RELAY_TCP_BUFFER_BYTES);
+    }
+
     // 1. Check for standard HTTP health-check requests (Render / uptime checks / browser visits)
     let mut peek_buf = [0u8; 1024];
     let n = raw_stream.peek(&mut peek_buf).await.unwrap_or(0);
@@ -33,7 +45,7 @@ pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry
     let (tx, mut rx) = mpsc::unbounded_channel::<SignalingMessage>();
     let (bin_tx, mut bin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    // Spawn outbound message pump (handles both JSON signaling & zero-overhead Binary relay frames)
+    // Spawn outbound message pump (handles both JSON signaling & batch-flushed zero-overhead Binary relay frames)
     let pump_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -41,7 +53,22 @@ pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry
                 maybe_bin = bin_rx.recv() => {
                     match maybe_bin {
                         Some(raw_frame) => {
-                            if ws_sender.send(Message::Binary(raw_frame)).await.is_err() {
+                            if ws_sender.feed(Message::Binary(raw_frame)).await.is_err() {
+                                break;
+                            }
+                            let mut batched = 1usize;
+                            while batched < RELAY_SEND_BATCH_MAX {
+                                match bin_rx.try_recv() {
+                                    Ok(next_frame) => {
+                                        if ws_sender.feed(Message::Binary(next_frame)).await.is_err() {
+                                            return;
+                                        }
+                                        batched += 1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            if ws_sender.flush().await.is_err() {
                                 break;
                             }
                         }

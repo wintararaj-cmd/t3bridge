@@ -433,17 +433,34 @@ body {
 /* Metrics Grid */
 .metrics-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
 }
 
 .metric-card {
   background-color: var(--card-bg);
   border: 1px solid var(--border-color);
   border-radius: 10px;
-  padding: 12px 14px;
+  padding: 12px 12px;
   display: flex;
   flex-direction: column;
+  min-width: 0;
+}
+
+.transport-p2p {
+  color: #10b981 !important;
+}
+
+.transport-relay {
+  color: #f59e0b !important;
+}
+
+.transport-legacy {
+  color: #f97316 !important;
+}
+
+.transport-idle {
+  color: #94a3b8 !important;
 }
 
 .health-optimal {
@@ -495,9 +512,12 @@ body {
 }
 
 .metric-value {
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 700;
   color: #60a5fa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* License & HWID */
@@ -617,6 +637,11 @@ input:checked + .slider:before {
 
 .badge-secondary {
   color: #94a3b8;
+  font-weight: 600;
+}
+
+.badge-warning {
+  color: #f59e0b;
   font-weight: 600;
 }
 

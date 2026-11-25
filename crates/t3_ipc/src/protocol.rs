@@ -1,6 +1,6 @@
 use crate::config::{ServiceConfig, ServiceMode};
 use serde::{Deserialize, Serialize};
-use t3_domain::License;
+use t3_domain::{License, TransportMode};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\t3bridge_service";
 pub const SERVICE_NAME: &str = "t3BridgeService";
@@ -37,6 +37,8 @@ pub struct HostSnapshot {
     pub detected_shares: Vec<String>,
     pub active_nodes: u32,
     pub max_nodes: u32,
+    #[serde(default)]
+    pub transport_mode: TransportMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -53,6 +55,8 @@ pub struct ClientSnapshot {
     pub is_safe: bool,
     pub status_text: String,
     pub alert_message: Option<String>,
+    #[serde(default)]
+    pub transport_mode: TransportMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,7 +219,7 @@ pub async fn send_ipc_request(req: &IpcRequest) -> Result<IpcResponse, String> {
     let mut reader = BufReader::new(pipe);
     let mut line = String::new();
     tokio::time::timeout(
-        tokio::time::Duration::from_secs(30),
+        tokio::time::Duration::from_secs(90),
         reader.read_line(&mut line),
     )
     .await
@@ -266,9 +270,18 @@ mod tests {
             _ => panic!("unexpected variant"),
         }
 
-        let resp = IpcResponse::Status(ServiceSnapshot::default());
+        let mut snap = ServiceSnapshot::default();
+        snap.client.transport_mode = TransportMode::DirectUdpP2p;
+        snap.host.transport_mode = TransportMode::WsBinaryRelay;
+        let resp = IpcResponse::Status(snap);
         let resp_json = serde_json::to_string(&resp).unwrap();
         let parsed_resp: IpcResponse = serde_json::from_str(&resp_json).unwrap();
-        assert!(matches!(parsed_resp, IpcResponse::Status(_)));
+        match parsed_resp {
+            IpcResponse::Status(s) => {
+                assert_eq!(s.client.transport_mode, TransportMode::DirectUdpP2p);
+                assert_eq!(s.host.transport_mode, TransportMode::WsBinaryRelay);
+            }
+            _ => panic!("unexpected variant"),
+        }
     }
 }

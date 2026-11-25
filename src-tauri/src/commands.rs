@@ -12,7 +12,7 @@ use t3_application::usecases::{
 };
 use t3_domain::{
     AppProfile, ConnectionHealth, License, LicenseStatus, Peer, PeerRole,
-    SignalingMessage, TunnelMetrics, VirtualIp,
+    SignalingMessage, TransportMode, TunnelMetrics, VirtualIp,
 };
 use t3_ipc::{
     get_shared_data_dir, get_shared_license_path, load_service_config, protect_secret,
@@ -61,6 +61,8 @@ pub struct UiHostStatus {
     pub detected_shares: Vec<String>,
     pub active_nodes: u32,
     pub max_nodes: u32,
+    pub transport_mode: String,
+    pub transport_mode_label: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -74,6 +76,19 @@ pub struct UiSessionStatus {
     pub is_safe: bool,
     pub alert_message: Option<String>,
     pub target_ip: Option<String>,
+    pub transport_mode: String,
+    pub transport_mode_label: String,
+}
+
+fn transport_mode_fields(mode: TransportMode) -> (String, String) {
+    let code = match mode {
+        TransportMode::Disconnected => "disconnected",
+        TransportMode::LanDirect => "lan_direct",
+        TransportMode::DirectUdpP2p => "direct_udp_p2p",
+        TransportMode::WsBinaryRelay => "ws_binary_relay",
+        TransportMode::WsLegacyRelay => "ws_legacy_relay",
+    };
+    (code.to_string(), mode.to_string())
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -157,13 +172,6 @@ pub fn hash_password_with_salt(password: &str, salt: &str) -> String {
 }
 
 pub async fn compute_host_code(state: &AppState) -> String {
-    // Reuse persisted host_code from shared service_config.json if available so UI and Service always match!
-    if let Ok(svc_cfg) = load_service_config() {
-        if !svc_cfg.host.host_code.trim().is_empty() {
-            return svc_cfg.host.host_code;
-        }
-    }
-
     let license_check = CheckLicenseStatusUseCase::new(
         Arc::clone(&state.hwid_provider),
         Arc::clone(&state.storage),
@@ -202,9 +210,25 @@ pub async fn compute_host_code(state: &AppState) -> String {
             if clean_company.len() > 16 {
                 clean_company.truncate(16);
             }
-            format!("{}-{}", clean_company, clean_user)
+            let licensed_code = format!("{}-{}", clean_company, clean_user);
+            if let Ok(mut svc_cfg) = load_service_config() {
+                if svc_cfg.host.host_code.trim().is_empty()
+                    || svc_cfg.host.host_code.starts_with("TRIAL-")
+                {
+                    svc_cfg.host.host_code = licensed_code.clone();
+                    let _ = save_service_config(&svc_cfg);
+                }
+            }
+            licensed_code
         }
         _ => {
+            // Reuse persisted host_code from shared service_config.json if available so UI and Service always match!
+            if let Ok(svc_cfg) = load_service_config() {
+                if !svc_cfg.host.host_code.trim().is_empty() {
+                    return svc_cfg.host.host_code;
+                }
+            }
+
             let hwid = state
                 .hwid_provider
                 .get_hardware_id()
@@ -389,13 +413,32 @@ pub async fn activate_license(
     raw_key: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<License, String> {
+    if let Ok(resp) = send_ipc_request(&IpcRequest::ActivateLicense {
+        raw_key: raw_key.clone(),
+    })
+    .await
+    {
+        match resp {
+            IpcResponse::ActivatedLicense(lic) => {
+                let new_code = compute_host_code(&state).await;
+                *state.host_code.lock().await = new_code;
+                return Ok(lic);
+            }
+            IpcResponse::Error { message } => return Err(message),
+            _ => {}
+        }
+    }
+
     let usecase = ActivateLicenseUseCase::new(
         Arc::clone(&state.verifier),
         Arc::clone(&state.hwid_provider),
         Arc::clone(&state.storage),
     );
 
-    usecase.execute(&raw_key).await.map_err(|e| e.to_string())
+    let lic = usecase.execute(&raw_key).await.map_err(|e| e.to_string())?;
+    let new_code = compute_host_code(&state).await;
+    *state.host_code.lock().await = new_code;
+    Ok(lic)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -748,7 +791,7 @@ pub async fn connect_peer_only(
         .flatten()
         .map(|c| c.remember)
         .unwrap_or(true);
-    if let Ok(resp) = send_ipc_request(&IpcRequest::ConnectClient {
+    match send_ipc_request(&IpcRequest::ConnectClient {
         target_peer_id: target_peer_id.clone(),
         password: password.clone(),
         signaling_url: signaling_url.clone(),
@@ -758,24 +801,29 @@ pub async fn connect_peer_only(
     })
     .await
     {
-        match resp {
-            IpcResponse::ClientConnected {
+        Ok(IpcResponse::ClientConnected {
+            server_ip,
+            is_wan,
+            peer_id,
+            discovered_shares,
+        }) => {
+            *state.active_server_ip.lock().await = Some(server_ip.clone());
+            *state.discovered_shares.lock().await = discovered_shares;
+            return Ok(PeerConnectionInfo {
                 server_ip,
                 is_wan,
                 peer_id,
-                discovered_shares,
-            } => {
-                *state.active_server_ip.lock().await = Some(server_ip.clone());
-                *state.discovered_shares.lock().await = discovered_shares;
-                return Ok(PeerConnectionInfo {
-                    server_ip,
-                    is_wan,
-                    peer_id,
-                });
-            }
-            IpcResponse::Error { message } => return Err(message),
-            _ => {}
+            });
         }
+        Ok(IpcResponse::Error { message }) => return Err(message),
+        Ok(_) => {}
+        Err(e) if !e.starts_with("Service IPC unavailable") => {
+            return Err(format!(
+                "Windows Service did not finish connecting in time ({}). If the cloud signaling server is waking up, please wait a moment and try again.",
+                e
+            ));
+        }
+        Err(_) => {}
     }
 
     // License check
@@ -1106,7 +1154,7 @@ pub async fn start_host_mode(
     state: tauri::State<'_, AppState>,
 ) -> Result<UiHostStatus, String> {
     // Delegate to Windows Service if running (persists Host mode for automatic boot startup!)
-    if let Ok(resp) = send_ipc_request(&IpcRequest::StartHost {
+    match send_ipc_request(&IpcRequest::StartHost {
         signaling_url: signaling_url.clone(),
         share_folder_path: share_folder_path.clone(),
         share_name: share_name.clone(),
@@ -1114,26 +1162,35 @@ pub async fn start_host_mode(
     })
     .await
     {
-        match resp {
-            IpcResponse::Status(snap) => {
-                *state.is_hosting.lock().await = snap.host.is_hosting;
-                *state.host_code.lock().await = snap.host.host_code.clone();
-                return Ok(UiHostStatus {
-                    is_hosting: snap.host.is_hosting,
-                    host_code: snap.host.host_code,
-                    virtual_ip: snap.host.virtual_ip,
-                    signaling_url: snap.host.signaling_url,
-                    message: snap.host.message,
-                    share_name: snap.host.share_name,
-                    share_path: snap.host.share_path,
-                    detected_shares: snap.host.detected_shares,
-                    active_nodes: snap.host.active_nodes,
-                    max_nodes: snap.host.max_nodes,
-                });
-            }
-            IpcResponse::Error { message } => return Err(message),
-            _ => {}
+        Ok(IpcResponse::Status(snap)) => {
+            *state.is_hosting.lock().await = snap.host.is_hosting;
+            *state.host_code.lock().await = snap.host.host_code.clone();
+            let (transport_mode, transport_mode_label) =
+                transport_mode_fields(snap.host.transport_mode);
+            return Ok(UiHostStatus {
+                is_hosting: snap.host.is_hosting,
+                host_code: snap.host.host_code,
+                virtual_ip: snap.host.virtual_ip,
+                signaling_url: snap.host.signaling_url,
+                message: snap.host.message,
+                share_name: snap.host.share_name,
+                share_path: snap.host.share_path,
+                detected_shares: snap.host.detected_shares,
+                active_nodes: snap.host.active_nodes,
+                max_nodes: snap.host.max_nodes,
+                transport_mode,
+                transport_mode_label,
+            });
         }
+        Ok(IpcResponse::Error { message }) => return Err(message),
+        Ok(_) => {}
+        Err(e) if !e.starts_with("Service IPC unavailable") => {
+            return Err(format!(
+                "Windows Service did not finish starting Host Mode in time ({}). If the cloud signaling server is waking up, please wait a moment and try again.",
+                e
+            ));
+        }
+        Err(_) => {}
     }
 
     // 1. Enforce that host password must be configured
@@ -1458,6 +1515,7 @@ pub async fn start_host_mode(
     *state.host_share_name.lock().await = resolved_share_name.clone();
     *state.host_share_path.lock().await = resolved_share_path.clone();
 
+    let (transport_mode, transport_mode_label) = transport_mode_fields(TransportMode::Disconnected);
     Ok(UiHostStatus {
         is_hosting: true,
         host_code: code,
@@ -1469,6 +1527,8 @@ pub async fn start_host_mode(
         detected_shares,
         active_nodes: 0,
         max_nodes: allowed_nodes,
+        transport_mode,
+        transport_mode_label,
     })
 }
 
@@ -1495,6 +1555,8 @@ pub async fn stop_host_mode(state: tauri::State<'_, AppState>) -> Result<(), Str
 #[tauri::command]
 pub async fn get_host_status(state: tauri::State<'_, AppState>) -> Result<UiHostStatus, String> {
     if let Ok(IpcResponse::Status(snap)) = send_ipc_request(&IpcRequest::GetStatus).await {
+        let (transport_mode, transport_mode_label) =
+            transport_mode_fields(snap.host.transport_mode);
         return Ok(UiHostStatus {
             is_hosting: snap.host.is_hosting,
             host_code: snap.host.host_code,
@@ -1506,6 +1568,8 @@ pub async fn get_host_status(state: tauri::State<'_, AppState>) -> Result<UiHost
             detected_shares: snap.host.detected_shares,
             active_nodes: snap.host.active_nodes,
             max_nodes: snap.host.max_nodes,
+            transport_mode,
+            transport_mode_label,
         });
     }
 
@@ -1521,6 +1585,12 @@ pub async fn get_host_status(state: tauri::State<'_, AppState>) -> Result<UiHost
     } else {
         Vec::new()
     };
+    let host_mode = if hosting && active_nodes > 0 {
+        state.tunnel.active_transport_mode()
+    } else {
+        TransportMode::Disconnected
+    };
+    let (transport_mode, transport_mode_label) = transport_mode_fields(host_mode);
     Ok(UiHostStatus {
         is_hosting: hosting,
         host_code: code,
@@ -1536,6 +1606,8 @@ pub async fn get_host_status(state: tauri::State<'_, AppState>) -> Result<UiHost
         detected_shares,
         active_nodes,
         max_nodes,
+        transport_mode,
+        transport_mode_label,
     })
 }
 
@@ -1585,6 +1657,8 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
         let drive = *state.active_drive.lock().await;
         let mapped_unc = state.active_unc.lock().await.clone();
         if snap.client.is_tunnel_connected {
+            let (transport_mode, transport_mode_label) =
+                transport_mode_fields(snap.client.transport_mode);
             return Ok(UiSessionStatus {
                 is_connected: true,
                 drive_letter: drive.or(snap.client.desired_drive_letter),
@@ -1605,8 +1679,12 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
                 is_safe: snap.client.is_safe,
                 alert_message: snap.client.alert_message,
                 target_ip: snap.client.server_ip,
+                transport_mode,
+                transport_mode_label,
             });
         } else {
+            let (transport_mode, transport_mode_label) =
+                transport_mode_fields(TransportMode::Disconnected);
             return Ok(UiSessionStatus {
                 is_connected: false,
                 drive_letter: None,
@@ -1617,6 +1695,8 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
                 is_safe: true,
                 alert_message: snap.last_event,
                 target_ip: None,
+                transport_mode,
+                transport_mode_label,
             });
         }
     }
@@ -1643,6 +1723,12 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
 
         let target_ip = state.active_server_ip.lock().await.clone();
         let health_level = format!("{:?}", report.health);
+        let mode = if target_ip.as_deref() == Some("10.99.0.1") {
+            state.tunnel.active_transport_mode()
+        } else {
+            TransportMode::LanDirect
+        };
+        let (transport_mode, transport_mode_label) = transport_mode_fields(mode);
 
         Ok(UiSessionStatus {
             is_connected: true,
@@ -1660,8 +1746,12 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
             is_safe: report.is_safe,
             alert_message: report.recommendation,
             target_ip,
+            transport_mode,
+            transport_mode_label,
         })
     } else {
+        let (transport_mode, transport_mode_label) =
+            transport_mode_fields(TransportMode::Disconnected);
         Ok(UiSessionStatus {
             is_connected: false,
             drive_letter: None,
@@ -1672,6 +1762,8 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
             is_safe: true,
             alert_message: None,
             target_ip: None,
+            transport_mode,
+            transport_mode_label,
         })
     }
 }
@@ -1983,5 +2075,31 @@ mod tests {
         assert_eq!(deserialized.saved_target, "TRIAL-ADMIN-4A2F");
         assert_eq!(deserialized.saved_password, "mysecret");
         assert!(deserialized.remember);
+    }
+
+    #[test]
+    fn test_transport_mode_fields_mapping() {
+        assert_eq!(
+            transport_mode_fields(TransportMode::DirectUdpP2p),
+            (
+                "direct_udp_p2p".to_string(),
+                "Direct P2P (WireGuard UDP)".to_string()
+            )
+        );
+        assert_eq!(
+            transport_mode_fields(TransportMode::WsBinaryRelay),
+            (
+                "ws_binary_relay".to_string(),
+                "Cloud Relay (Encrypted Binary WS)".to_string()
+            )
+        );
+        assert_eq!(
+            transport_mode_fields(TransportMode::LanDirect),
+            ("lan_direct".to_string(), "LAN Direct".to_string())
+        );
+        assert_eq!(
+            transport_mode_fields(TransportMode::Disconnected),
+            ("disconnected".to_string(), "Disconnected".to_string())
+        );
     }
 }

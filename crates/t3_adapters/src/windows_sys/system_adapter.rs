@@ -10,6 +10,118 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+const LANMAN_WORKSTATION_PARAMS_KEY: &str =
+    r"HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters";
+const LANMAN_SERVER_PARAMS_KEY: &str =
+    r"HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters";
+
+/// Registry DWORD tuning entry (`key_path`, `value_name`, `dword_value`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegistryDwordEntry {
+    pub key: &'static str,
+    pub value_name: &'static str,
+    pub data: u32,
+}
+
+/// Windows SMB Client (`LanmanWorkstation`) registry tuning for high-latency WAN & DBF/FoxPro ERPs.
+///
+/// - `DisableBandwidthThrottling = 1`: disables Windows SMB WAN throughput throttling.
+/// - `DisableLargeMtu = 0`: enables SMB 2/3 Large MTU (up to 1 MB multi-credit reads/writes).
+/// - Raised metadata cache capacities (`FileInfoCacheEntriesMax`, `DirectoryCacheEntriesMax`,
+///   `FileNotFoundCacheEntriesMax`) & lifetimes reduce repetitive SMB round-trips when legacy
+///   file-based ERPs (Marg/FoxPro/VB `.dbf`/`.cdx`) probe hundreds of files on startup.
+/// - `MaxCmds = 2048`: raises concurrent in-flight SMB requests over WAN links.
+pub(crate) fn smb_client_wan_tuning_entries() -> &'static [RegistryDwordEntry] {
+    &[
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "EnableInsecureGuestAuth",
+            data: 1,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "AllowInsecureGuestAuth",
+            data: 1,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "DisableBandwidthThrottling",
+            data: 1,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "DisableLargeMtu",
+            data: 0,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "FileInfoCacheEntriesMax",
+            data: 1024,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "DirectoryCacheEntriesMax",
+            data: 128,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "FileNotFoundCacheEntriesMax",
+            data: 512,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "FileInfoCacheLifetime",
+            data: 10,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "DirectoryCacheLifetime",
+            data: 10,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "FileNotFoundCacheLifetime",
+            data: 10,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "MaxCmds",
+            data: 2048,
+        },
+    ]
+}
+
+/// Windows SMB Server (`LanmanServer`) registry tuning on Host PCs serving DBF/ERP shares over WAN.
+///
+/// - `SizReqBuf = 65536`: 64 KB server request buffer (default 16 KB).
+/// - `IRPStackSize = 32`: prevents filter/antivirus stalls under heavy file-lock traffic.
+/// - `AsynchronousCredits = 512`: allows higher concurrent async SMB2/3 requests.
+/// - `DisableStrictNameChecking = 1`: allows clean SMB access via virtual tunnel IP (`10.99.0.1`).
+pub(crate) fn smb_server_wan_tuning_entries() -> &'static [RegistryDwordEntry] {
+    &[
+        RegistryDwordEntry {
+            key: LANMAN_SERVER_PARAMS_KEY,
+            value_name: "SizReqBuf",
+            data: 65536,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_SERVER_PARAMS_KEY,
+            value_name: "IRPStackSize",
+            data: 32,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_SERVER_PARAMS_KEY,
+            value_name: "AsynchronousCredits",
+            data: 512,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_SERVER_PARAMS_KEY,
+            value_name: "DisableStrictNameChecking",
+            data: 1,
+        },
+    ]
+}
+
 /// Parses `net view \\<host>` output and returns a list of Disk share names.
 /// Skips header lines, separator lines, and the final status line.
 fn parse_net_view_output(raw: &str) -> Vec<String> {
@@ -86,6 +198,36 @@ impl WindowsSystemAdapter {
         cmd.stdin(std::process::Stdio::null());
         cmd
     }
+
+    fn apply_registry_dword_entries(entries: &[RegistryDwordEntry]) {
+        for entry in entries {
+            let data_str = entry.data.to_string();
+            let _ = Self::hidden_command("reg")
+                .args([
+                    "add",
+                    entry.key,
+                    "/v",
+                    entry.value_name,
+                    "/t",
+                    "REG_DWORD",
+                    "/d",
+                    &data_str,
+                    "/f",
+                ])
+                .output();
+        }
+    }
+
+    /// Applies Windows SMB Client (`LanmanWorkstation`) WAN & DBF/ERP caching/Large-MTU tuning.
+    /// Safe and idempotent; requires Administrator / LocalSystem privileges for HKLM writes.
+    pub fn apply_smb_client_wan_tuning() {
+        Self::apply_registry_dword_entries(smb_client_wan_tuning_entries());
+    }
+
+    /// Applies Windows SMB Server (`LanmanServer`) WAN & DBF/ERP throughput tuning on Host PCs.
+    pub fn apply_smb_server_wan_tuning() {
+        Self::apply_registry_dword_entries(smb_server_wan_tuning_entries());
+    }
 }
 
 impl Default for WindowsSystemAdapter {
@@ -120,34 +262,9 @@ impl WindowsSystemPort for WindowsSystemAdapter {
             ])
             .output();
 
-        // 2. Enable Insecure Guest Auth for SMB client (critical for Windows 10/11 WAN connections)
-        let _ = Self::hidden_command("reg")
-            .args([
-                "add",
-                r"HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters",
-                "/v",
-                "EnableInsecureGuestAuth",
-                "/t",
-                "REG_DWORD",
-                "/d",
-                "1",
-                "/f",
-            ])
-            .output();
-
-        let _ = Self::hidden_command("reg")
-            .args([
-                "add",
-                r"HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters",
-                "/v",
-                "AllowInsecureGuestAuth",
-                "/t",
-                "REG_DWORD",
-                "/d",
-                "1",
-                "/f",
-            ])
-            .output();
+        // 2. Apply SMB Client WAN & DBF/ERP Performance Registry Tuning
+        //    (Guest Auth, DisableBandwidthThrottling=1, DisableLargeMtu=0, metadata cache sizes & lifetimes, MaxCmds)
+        Self::apply_smb_client_wan_tuning();
 
         // 3. Clear any existing mapping or stale connection on this drive letter
         let _ = Self::hidden_command("net")
@@ -233,6 +350,9 @@ impl WindowsSystemPort for WindowsSystemAdapter {
     }
 
     async fn configure_firewall_rule(&self, subnet_cidr: &str) -> DomainResult<()> {
+        // Apply SMB Server WAN & DBF throughput registry tuning on Host PCs
+        Self::apply_smb_server_wan_tuning();
+
         // Ensure Windows SMB Server (LanmanServer) service is set to Auto and running
         let _ = Self::hidden_command("sc")
             .args(["config", "LanmanServer", "start=", "auto"])
@@ -385,5 +505,33 @@ The command completed successfully.
 "#;
         let shares = parse_net_view_output(sample);
         assert_eq!(shares, vec!["MargERP", "python"]);
+    }
+
+    #[test]
+    fn test_smb_client_wan_tuning_entries_cover_dbf_and_large_mtu() {
+        let entries = smb_client_wan_tuning_entries();
+        let find = |name: &str| entries.iter().find(|e| e.value_name == name).map(|e| e.data);
+
+        assert_eq!(find("DisableBandwidthThrottling"), Some(1));
+        assert_eq!(find("DisableLargeMtu"), Some(0));
+        assert_eq!(find("FileInfoCacheEntriesMax"), Some(1024));
+        assert_eq!(find("DirectoryCacheEntriesMax"), Some(128));
+        assert_eq!(find("FileNotFoundCacheEntriesMax"), Some(512));
+        assert_eq!(find("MaxCmds"), Some(2048));
+        assert!(entries
+            .iter()
+            .all(|e| e.key == LANMAN_WORKSTATION_PARAMS_KEY));
+    }
+
+    #[test]
+    fn test_smb_server_wan_tuning_entries_cover_host_throughput() {
+        let entries = smb_server_wan_tuning_entries();
+        let find = |name: &str| entries.iter().find(|e| e.value_name == name).map(|e| e.data);
+
+        assert_eq!(find("SizReqBuf"), Some(65536));
+        assert_eq!(find("IRPStackSize"), Some(32));
+        assert_eq!(find("AsynchronousCredits"), Some(512));
+        assert_eq!(find("DisableStrictNameChecking"), Some(1));
+        assert!(entries.iter().all(|e| e.key == LANMAN_SERVER_PARAMS_KEY));
     }
 }

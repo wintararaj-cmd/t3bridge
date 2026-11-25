@@ -145,6 +145,10 @@
         <!-- Live Metrics Card -->
         <div class="metrics-grid">
           <div class="metric-card">
+            <span class="metric-label">Transport Mode</span>
+            <span class="metric-value transport-idle" id="metricTransport">--</span>
+          </div>
+          <div class="metric-card">
             <span class="metric-label">Latency</span>
             <span class="metric-value" id="metricLatency">-- ms</span>
           </div>
@@ -371,6 +375,10 @@
             <div class="info-item">
               <span class="info-label">Active Branch Nodes:</span>
               <span id="hostActiveNodesBadge" class="badge-secondary">0 / 3 Nodes Connected</span>
+            </div>
+            <div class="info-item">
+              <span class="info-label">Active Transport Mode:</span>
+              <span id="hostTransportBadge" class="badge-secondary">Idle (Waiting for Peer)</span>
             </div>
             <div class="info-item" style="align-items: flex-start; flex-direction: column; gap: 6px;">
               <span class="info-label">📁 Active Shares Available to Clients:</span>

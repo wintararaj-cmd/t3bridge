@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 t3_domain = { path = "../t3_domain" }
 tokio.workspace = true
+socket2.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 serde.workspace = true

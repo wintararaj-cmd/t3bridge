@@ -16,7 +16,7 @@ use t3_application::usecases::{
 };
 use t3_domain::{
     ConnectionHealth, HolePunchPayload, LicenseStatus, Peer, PeerRole, SignalingMessage,
-    TunnelMetrics, VirtualIp,
+    TransportMode, TunnelMetrics, VirtualIp,
 };
 use t3_ipc::{
     generate_salt, get_shared_data_dir, get_shared_license_path, hash_password_with_salt,
@@ -271,14 +271,6 @@ impl ServiceEngine {
     }
 
     pub async fn compute_host_code(&self) -> String {
-        // Reuse persisted host_code if already generated so Session 0 (SYSTEM) and Session 1 (User) match!
-        {
-            let cfg = self.config.lock().await;
-            if !cfg.host.host_code.trim().is_empty() {
-                return cfg.host.host_code.clone();
-            }
-        }
-
         let license_check = CheckLicenseStatusUseCase::new(
             Arc::clone(&self.hwid_provider),
             Arc::clone(&self.storage),
@@ -323,9 +315,28 @@ impl ServiceEngine {
                 if clean_company.len() > 16 {
                     clean_company.truncate(16);
                 }
-                format!("{}-{}", clean_company, clean_name)
+                let licensed_code = format!("{}-{}", clean_company, clean_name);
+                // Replace any stale TRIAL-* code cached before license activation
+                {
+                    let mut cfg = self.config.lock().await;
+                    if cfg.host.host_code.trim().is_empty()
+                        || cfg.host.host_code.starts_with("TRIAL-")
+                    {
+                        cfg.host.host_code = licensed_code.clone();
+                        let _ = save_service_config(&cfg);
+                    }
+                }
+                licensed_code
             }
             _ => {
+                // Reuse persisted host_code if already generated so Session 0 (SYSTEM) and Session 1 (User) match!
+                {
+                    let cfg = self.config.lock().await;
+                    if !cfg.host.host_code.trim().is_empty() {
+                        return cfg.host.host_code.clone();
+                    }
+                }
+
                 let hwid = self
                     .hwid_provider
                     .get_hardware_id()
@@ -351,7 +362,9 @@ impl ServiceEngine {
             return Err("Please set a Host Access Password before starting Host Server Mode.".into());
         }
 
-        let code = if cfg.host.host_code.trim().is_empty() {
+        let code = if cfg.host.host_code.trim().is_empty()
+            || cfg.host.host_code.starts_with("TRIAL-")
+        {
             self.compute_host_code().await
         } else {
             cfg.host.host_code.clone()
@@ -420,19 +433,23 @@ impl ServiceEngine {
             .args(["share", &net_share_arg, "/grant:Everyone,FULL", "/y"])
             .output();
 
-        let mut icacls_cmd = std::process::Command::new("icacls");
-        #[cfg(windows)]
-        icacls_cmd.creation_flags(0x08000000);
-        let _ = icacls_cmd
-            .args([
-                &resolved_share_path,
-                "/grant",
-                "Everyone:(OI)(CI)F",
-                "/T",
-                "/C",
-                "/Q",
-            ])
-            .output();
+        // Run icacls asynchronously so large shared folders never block StartHost IPC
+        let icacls_path = resolved_share_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut icacls_cmd = std::process::Command::new("icacls");
+            #[cfg(windows)]
+            icacls_cmd.creation_flags(0x08000000);
+            let _ = icacls_cmd
+                .args([
+                    &icacls_path,
+                    "/grant",
+                    "Everyone:(OI)(CI)F",
+                    "/T",
+                    "/C",
+                    "/Q",
+                ])
+                .output();
+        });
 
         self.tunnel
             .start_adapter(VirtualIp::new("10.99.0.1", 24).unwrap())
@@ -704,6 +721,7 @@ impl ServiceEngine {
             detected_shares,
             active_nodes: 0,
             max_nodes: allowed_nodes,
+            transport_mode: TransportMode::Disconnected,
         })
     }
 
@@ -1090,6 +1108,13 @@ impl ServiceEngine {
             Vec::new()
         };
 
+        let active_nodes = self.host_connected_clients.lock().await.len() as u32;
+        let host_transport_mode = if is_hosting && active_nodes > 0 {
+            self.tunnel.active_transport_mode()
+        } else {
+            TransportMode::Disconnected
+        };
+
         let host_snap = HostSnapshot {
             is_hosting,
             host_code,
@@ -1104,8 +1129,9 @@ impl ServiceEngine {
             share_name: cfg.host.share_name.clone(),
             share_path: cfg.host.share_path.clone(),
             detected_shares,
-            active_nodes: self.host_connected_clients.lock().await.len() as u32,
+            active_nodes,
             max_nodes: *self.host_max_nodes.lock().await,
+            transport_mode: host_transport_mode,
         };
 
         let (latency_ms, health_level, is_safe, alert_message) = if is_client_connected {
@@ -1145,6 +1171,15 @@ impl ServiceEngine {
             ConnectionPhase::Disconnected => "Disconnected".into(),
         };
 
+        let is_wan = *self.active_is_wan.lock().await;
+        let client_transport_mode = if !is_client_connected {
+            TransportMode::Disconnected
+        } else if !is_wan {
+            TransportMode::LanDirect
+        } else {
+            self.tunnel.active_transport_mode()
+        };
+
         let client_snap = ClientSnapshot {
             is_tunnel_connected: is_client_connected,
             target_peer_id: if cfg.client.target_peer_id.is_empty() {
@@ -1153,7 +1188,7 @@ impl ServiceEngine {
                 Some(cfg.client.target_peer_id.clone())
             },
             server_ip: self.active_server_ip.lock().await.clone(),
-            is_wan: *self.active_is_wan.lock().await,
+            is_wan,
             discovered_shares: self.discovered_shares.lock().await.clone(),
             desired_share_name: cfg.client.share_name.clone(),
             desired_drive_letter: Some(cfg.client.drive_letter),
@@ -1162,6 +1197,7 @@ impl ServiceEngine {
             is_safe,
             status_text,
             alert_message,
+            transport_mode: client_transport_mode,
         };
 
         ServiceSnapshot {
@@ -1261,7 +1297,16 @@ impl ServiceEngine {
                     Arc::clone(&self.storage),
                 );
                 match uc.execute(&raw_key).await {
-                    Ok(lic) => IpcResponse::ActivatedLicense(lic),
+                    Ok(lic) => {
+                        // Refresh cached host_code so TRIAL-* upgrades immediately to the licensed code
+                        let new_code = self.compute_host_code().await;
+                        let mut cfg = self.config.lock().await;
+                        if cfg.host.host_code != new_code {
+                            cfg.host.host_code = new_code;
+                            let _ = save_service_config(&cfg);
+                        }
+                        IpcResponse::ActivatedLicense(lic)
+                    }
                     Err(e) => IpcResponse::Error {
                         message: e.to_string(),
                     },
@@ -1270,7 +1315,7 @@ impl ServiceEngine {
             IpcRequest::GetHostConfig => {
                 let code = self.compute_host_code().await;
                 let mut cfg = self.config.lock().await;
-                if cfg.host.host_code.is_empty() {
+                if cfg.host.host_code.is_empty() || cfg.host.host_code != code {
                     cfg.host.host_code = code.clone();
                     let _ = save_service_config(&cfg);
                 }

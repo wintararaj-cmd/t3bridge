@@ -1,11 +1,24 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use socket2::SockRef;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream};
 use t3_application::ports::SignalingPort;
 use t3_domain::{DomainError, DomainResult, HolePunchPayload, Peer, SignalingMessage, VirtualIp};
+
+/// Desired TCP socket buffer size (2 MB) for low-latency WebSocket relay bursts
+const WS_TCP_SOCKET_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum number of queued WebSocket frames coalesced into a single TLS flush
+const WS_SEND_BATCH_MAX: usize = 64;
+
+fn tune_ws_tcp_socket(tcp: &tokio::net::TcpStream) {
+    let _ = tcp.set_nodelay(true);
+    let sock_ref = SockRef::from(tcp);
+    let _ = sock_ref.set_recv_buffer_size(WS_TCP_SOCKET_BUFFER_BYTES);
+    let _ = sock_ref.set_send_buffer_size(WS_TCP_SOCKET_BUFFER_BYTES);
+}
 
 pub struct WebSocketSignalingClient {
     tx: Arc<Mutex<Option<mpsc::UnboundedSender<SignalingMessage>>>>,
@@ -74,9 +87,16 @@ impl SignalingPort for WebSocketSignalingClient {
     async fn connect(&self, signaling_url: &str) -> DomainResult<()> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let (ws_stream, _) = connect_async(signaling_url)
+        // Connect with disable_nagle = true (TCP_NODELAY) to eliminate 40-200ms Nagle stalls on SMB/DBF traffic
+        let (ws_stream, _) = connect_async_with_config(signaling_url, None, true)
             .await
             .map_err(|e| DomainError::NetworkFailure(format!("Signaling connect error: {}", e)))?;
+
+        match ws_stream.get_ref() {
+            MaybeTlsStream::Plain(tcp) => tune_ws_tcp_socket(tcp),
+            MaybeTlsStream::Rustls(tls) => tune_ws_tcp_socket(tls.get_ref().0),
+            _ => {}
+        }
 
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SignalingMessage>();
@@ -107,10 +127,25 @@ impl SignalingPort for WebSocketSignalingClient {
             }
         });
 
-        // Outbound WebSocket frame pump (handles Binary, Text, Ping, Pong)
+        // Outbound WebSocket frame pump (batch-feeds bursts then flushes once for low latency)
         tokio::spawn(async move {
-            while let Some(frame) = raw_rx.recv().await {
-                if ws_sender.send(frame).await.is_err() {
+            while let Some(first_frame) = raw_rx.recv().await {
+                if ws_sender.feed(first_frame).await.is_err() {
+                    break;
+                }
+                let mut batched = 1usize;
+                while batched < WS_SEND_BATCH_MAX {
+                    match raw_rx.try_recv() {
+                        Ok(next_frame) => {
+                            if ws_sender.feed(next_frame).await.is_err() {
+                                return;
+                            }
+                            batched += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if ws_sender.flush().await.is_err() {
                     break;
                 }
             }
