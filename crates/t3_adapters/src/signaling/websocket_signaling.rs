@@ -10,6 +10,8 @@ use t3_domain::{DomainError, DomainResult, HolePunchPayload, Peer, SignalingMess
 pub struct WebSocketSignalingClient {
     tx: Arc<Mutex<Option<mpsc::UnboundedSender<SignalingMessage>>>>,
     inbound_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<SignalingMessage>>>>,
+    binary_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    binary_inbound_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>>,
 }
 
 impl WebSocketSignalingClient {
@@ -17,6 +19,8 @@ impl WebSocketSignalingClient {
         Self {
             tx: Arc::new(Mutex::new(None)),
             inbound_rx: Arc::new(Mutex::new(None)),
+            binary_tx: Arc::new(Mutex::new(None)),
+            binary_inbound_rx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -37,6 +41,16 @@ impl WebSocketSignalingClient {
 
     pub async fn get_sender(&self) -> Option<mpsc::UnboundedSender<SignalingMessage>> {
         self.tx.lock().await.clone()
+    }
+
+    /// Returns a zero-JSON sender for raw `Message::Binary` relay frames.
+    pub async fn get_binary_sender(&self) -> Option<mpsc::UnboundedSender<Vec<u8>>> {
+        self.binary_tx.lock().await.clone()
+    }
+
+    /// Takes the receiver for inbound `Message::Binary` relay frames.
+    pub async fn take_binary_receiver(&self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
+        self.binary_inbound_rx.lock().await.take()
     }
 
     pub async fn is_connected(&self) -> bool {
@@ -66,23 +80,50 @@ impl SignalingPort for WebSocketSignalingClient {
 
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SignalingMessage>();
+        let (bin_outbound_tx, mut bin_outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<Message>();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<SignalingMessage>();
+        let (bin_inbound_tx, bin_inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        // Outbound pump
+        // Bridge SignalingMessage outbound channel -> raw WebSocket Text frames
+        let raw_tx_for_app = raw_tx.clone();
         tokio::spawn(async move {
             while let Some(msg) = outbound_rx.recv().await {
                 if let Ok(json) = serde_json::to_string(&msg) {
-                    if ws_sender.send(Message::Text(json)).await.is_err() {
+                    if raw_tx_for_app.send(Message::Text(json)).is_err() {
                         break;
                     }
                 }
             }
         });
 
+        // Bridge raw binary relay outbound channel -> raw WebSocket Binary frames (zero JSON/Base64)
+        let raw_tx_for_bin = raw_tx.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = bin_outbound_rx.recv().await {
+                if raw_tx_for_bin.send(Message::Binary(frame)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Outbound WebSocket frame pump (handles Binary, Text, Ping, Pong)
+        tokio::spawn(async move {
+            while let Some(frame) = raw_rx.recv().await {
+                if ws_sender.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         // Inbound pump
+        let raw_tx_for_pong = raw_tx.clone();
         tokio::spawn(async move {
             loop {
                 match ws_receiver.next().await {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let _ = bin_inbound_tx.send(bytes);
+                    }
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(msg) = serde_json::from_str::<SignalingMessage>(&text) {
                             // Consume keepalive pong frames so they do not disrupt request/response channels
@@ -94,11 +135,15 @@ impl SignalingPort for WebSocketSignalingClient {
                             }
                         }
                     }
-                    Some(Ok(other)) => {
-                        // Ping/Pong/Binary frames must not terminate the pump
-                        if matches!(other, Message::Close(_)) {
-                            break;
-                        }
+                    Some(Ok(Message::Ping(payload))) => {
+                        // Explicitly reply with WebSocket Pong so reverse proxies / mobile NATs keep the socket alive
+                        let _ = raw_tx_for_pong.send(Message::Pong(payload));
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        break;
+                    }
+                    Some(Ok(_)) => {
+                        // Pong frames must not terminate the pump
                     }
                     Some(Err(_)) | None => {
                         break;
@@ -107,16 +152,21 @@ impl SignalingPort for WebSocketSignalingClient {
             }
         });
 
-        // Background Keepalive Ping every 20 seconds to prevent Render / Cloudflare idle timeouts
+        // Background Keepalive Ping every 15 seconds to survive mobile hotspot / CGNAT / Render idle timeouts
         let ping_tx = outbound_tx.clone();
+        let raw_ping_tx = raw_tx.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
             interval.tick().await; // Initial tick completes immediately
             loop {
                 interval.tick().await;
-                if ping_tx.send(SignalingMessage::Ping {
-                    peer_id: "keepalive".into(),
-                }).is_err() {
+                let app_ok = ping_tx
+                    .send(SignalingMessage::Ping {
+                        peer_id: "keepalive".into(),
+                    })
+                    .is_ok();
+                let ws_ok = raw_ping_tx.send(Message::Ping(Vec::new())).is_ok();
+                if !app_ok || !ws_ok {
                     break;
                 }
             }
@@ -124,6 +174,8 @@ impl SignalingPort for WebSocketSignalingClient {
 
         *self.tx.lock().await = Some(outbound_tx);
         *self.inbound_rx.lock().await = Some(inbound_rx);
+        *self.binary_tx.lock().await = Some(bin_outbound_tx);
+        *self.binary_inbound_rx.lock().await = Some(bin_inbound_rx);
 
         Ok(())
     }
@@ -239,6 +291,8 @@ impl SignalingPort for WebSocketSignalingClient {
     async fn disconnect(&self) -> DomainResult<()> {
         *self.tx.lock().await = None;
         *self.inbound_rx.lock().await = None;
+        *self.binary_tx.lock().await = None;
+        *self.binary_inbound_rx.lock().await = None;
         Ok(())
     }
 }

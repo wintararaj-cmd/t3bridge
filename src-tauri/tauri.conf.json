@@ -1,9 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "t3Bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.t3bridge.desktop",
   "build": {
+    "beforeBuildCommand": "cargo build --release -p t3_service",
     "frontendDist": "../ui"
   },
   "app": {
@@ -33,8 +34,9 @@
       "icons/icon.ico",
       "icons/icon.png"
     ],
-    "resources": [
-      "wintun.dll"
-    ]
+    "resources": {
+      "wintun.dll": "wintun.dll",
+      "../target/release/t3bridge-service.exe": "t3bridge-service.exe"
+    }
   }
 }

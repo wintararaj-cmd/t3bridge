@@ -1,0 +1,24 @@
+[package]
+name = "t3_service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "t3bridge-service"
+path = "src/main.rs"
+
+[dependencies]
+t3_domain = { path = "../t3_domain" }
+t3_application = { path = "../t3_application" }
+t3_adapters = { path = "../t3_adapters" }
+t3_ipc = { path = "../t3_ipc" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+rand.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"

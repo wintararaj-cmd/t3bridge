@@ -167,7 +167,7 @@ Content-Length: 0\r\nConnection: close\r\n\r\n";
     }
 
     if path == "/api/version" {
-        let latest_version = env::var("LATEST_VERSION").unwrap_or_else(|_| "0.1.0".into());
+        let latest_version = env::var("LATEST_VERSION").unwrap_or_else(|_| "0.2.0".into());
         let release_notes = env::var("RELEASE_NOTES").unwrap_or_else(|_| {
             "Official Release: WAN P2P mesh relay, persistent trial, and sleep prevention.".into()
         });

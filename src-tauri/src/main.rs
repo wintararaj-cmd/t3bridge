@@ -2,8 +2,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod tray;
 
 use commands::*;
+use tauri::{Manager, WindowEvent};
 
 #[cfg(windows)]
 extern "system" {
@@ -13,23 +15,6 @@ extern "system" {
         lp_name: *const u8,
     ) -> *mut std::ffi::c_void;
     fn GetLastError() -> u32;
-    fn SetThreadExecutionState(es_flags: u32) -> u32;
-}
-
-#[cfg(windows)]
-const ES_SYSTEM_REQUIRED: u32 = 0x00000001;
-#[cfg(windows)]
-const ES_AWAYMODE_REQUIRED: u32 = 0x00000040;
-#[cfg(windows)]
-const ES_CONTINUOUS: u32 = 0x80000000;
-
-fn prevent_system_sleep() {
-    #[cfg(windows)]
-    unsafe {
-        // Prevent Windows from entering sleep / standby / suspend while t3Bridge is running.
-        // ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED keeps CPU and networking active.
-        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
-    }
 }
 
 const ERROR_ALREADY_EXISTS: u32 = 183;
@@ -37,10 +22,10 @@ const ERROR_ALREADY_EXISTS: u32 = 183;
 fn is_first_instance() -> bool {
     #[cfg(windows)]
     unsafe {
-        let mutex_name = b"Global\\t3Bridge_SingleInstance_Mutex\0";
+        let mutex_name = b"Global\\t3Bridge_TrayUI_SingleInstance_Mutex\0";
         let handle = CreateMutexA(std::ptr::null_mut(), 1, mutex_name.as_ptr());
         if !handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
-            return false; // Another instance is already running
+            return false; // Another UI instance is already running in Tray
         }
     }
     true
@@ -48,27 +33,31 @@ fn is_first_instance() -> bool {
 
 fn main() {
     if !is_first_instance() {
-        // Exit cleanly immediately if another instance is already open
         return;
     }
 
-    // Keep Windows awake for both Host and Client operations
-    prevent_system_sleep();
-
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            #[cfg(windows)]
-            unsafe {
-                SetThreadExecutionState(ES_SYSTEM_REQUIRED);
-            }
-        }
-    });
-
+    let start_minimized = std::env::args().any(|a| a == "--minimized");
     let app_state = init_app_state();
 
     tauri::Builder::default()
         .manage(app_state)
+        .setup(move |app| {
+            tray::setup_tray(app)?;
+
+            if start_minimized {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Hide to System Tray instead of quitting so Tray status & auto-mount stay active
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_hardware_id,
             get_license_info,
@@ -89,7 +78,13 @@ fn main() {
             list_server_shares,
             mount_selected_share,
             open_folder,
-            open_external_url
+            open_external_url,
+            get_service_status,
+            install_windows_service,
+            uninstall_windows_service,
+            set_prevent_sleep,
+            set_auto_start,
+            trigger_service_reconnect
         ])
         .run(tauri::generate_context!())
         .expect("error while running t3Bridge application");

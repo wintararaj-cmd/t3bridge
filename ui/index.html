@@ -49,6 +49,21 @@
       </div>
     </div>
 
+    <!-- Windows Background Service Status Bar -->
+    <div id="serviceBar" style="display: flex; align-items: center; justify-content: space-between; gap: 10px; background: rgba(15, 23, 42, 0.85); border: 1px solid #334155; border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; font-size: 12px;">
+      <div style="display: flex; align-items: center; gap: 8px; min-width: 0;">
+        <span id="serviceStatusDot" style="width: 8px; height: 8px; border-radius: 50%; background: #64748b; display: inline-block; flex-shrink: 0;"></span>
+        <div style="overflow: hidden; text-overflow: ellipsis;">
+          <strong id="serviceStatusTitle" style="color: #e2e8f0;">Windows Service: Checking...</strong>
+          <div id="serviceLastEvent" style="font-size: 11px; color: #94a3b8;">Auto-starts Host/Client on boot &amp; recovers from sleep/Wi-Fi switch</div>
+        </div>
+      </div>
+      <div style="display: flex; gap: 6px; flex-shrink: 0;">
+        <button type="button" id="btnInstallService" class="btn btn-primary btn-sm" style="padding: 5px 10px; font-size: 11px;">Install Service</button>
+        <button type="button" id="btnUninstallService" class="btn btn-secondary btn-sm" style="display: none; padding: 5px 10px; font-size: 11px;">Uninstall</button>
+      </div>
+    </div>
+
     <!-- Navigation Tabs -->
     <nav class="nav-tabs">
       <button class="tab-btn active" data-tab="tab-connect">Connection</button>
@@ -88,7 +103,7 @@
             <div class="form-group" style="display: flex; align-items: flex-end; padding-bottom: 8px;">
               <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; font-size: 13px; font-weight: 500; color: #94a3b8; margin: 0;">
                 <input type="checkbox" id="chkRememberPassword" style="width: 16px; height: 16px; accent-color: #2563eb; cursor: pointer;" />
-                Remember Server &amp; Password
+                Remember &amp; Auto-Connect on Windows Boot
               </label>
             </div>
           </div>
@@ -302,6 +317,28 @@
             </div>
             <label class="switch">
               <input type="checkbox" id="toggleHostMode" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="toggle-row" style="margin-top: 8px;">
+            <div>
+              <strong>Keep PC Awake while Hosting (Prevent Sleep)</strong>
+              <div class="sub-text">Prevents Windows sleep while Host is active (display can still turn off).</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="togglePreventSleep" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="toggle-row" style="margin-top: 8px;">
+            <div>
+              <strong>Auto-Start on Windows Boot</strong>
+              <div class="sub-text">Automatically resumes Host/Client mode after Windows restarts (before login).</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="toggleAutoStart" checked />
               <span class="slider"></span>
             </label>
           </div>

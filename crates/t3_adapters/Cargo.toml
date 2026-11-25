@@ -19,4 +19,5 @@ rand.workspace = true
 tokio-tungstenite.workspace = true
 rustls.workspace = true
 futures-util.workspace = true
+boringtun.workspace = true
 wintun = "0.5"

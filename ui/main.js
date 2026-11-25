@@ -759,7 +759,7 @@ if (toggleHostMode) {
 }
 
 // Auto-Update and Node Badge Elements
-const CURRENT_APP_VERSION = "0.1.0";
+const CURRENT_APP_VERSION = "0.2.0";
 const updateBanner = document.getElementById('updateBanner');
 const updateVersionTitle = document.getElementById('updateVersionTitle');
 const updateNotes = document.getElementById('updateNotes');
@@ -785,12 +785,25 @@ if (btnDownloadUpdate) {
   });
 }
 
+function isNewerVersion(remote, current) {
+  const r = String(remote || '').replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  const c = String(current || '').replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  const len = Math.max(r.length, c.length);
+  for (let i = 0; i < len; i++) {
+    const rv = r[i] || 0;
+    const cv = c[i] || 0;
+    if (rv > cv) return true;
+    if (rv < cv) return false;
+  }
+  return false;
+}
+
 async function checkForUpdates() {
   try {
     const res = await fetch('https://t3bridge-signaling.onrender.com/api/version');
     if (!res.ok) return;
     const data = await res.json();
-    if (data.version && data.version !== CURRENT_APP_VERSION) {
+    if (data.version && isNewerVersion(data.version, CURRENT_APP_VERSION)) {
       if (updateBanner && updateVersionTitle) {
         updateVersionTitle.textContent = `New Version ${data.version} Available!`;
         if (updateNotes) updateNotes.textContent = data.release_notes || 'Improvements & bug fixes.';
@@ -809,7 +822,118 @@ loadLicenseStatus();
 loadHostConfig();
 loadClientCredentials();
 loadHostStatus();
+loadServiceStatus();
 checkForUpdates();
+
+// Poll Windows Service status every 3s
+setInterval(loadServiceStatus, 3000);
+
+// Windows Service & Power Control Elements
+const serviceStatusDot = document.getElementById('serviceStatusDot');
+const serviceStatusTitle = document.getElementById('serviceStatusTitle');
+const serviceLastEvent = document.getElementById('serviceLastEvent');
+const btnInstallService = document.getElementById('btnInstallService');
+const btnUninstallService = document.getElementById('btnUninstallService');
+const togglePreventSleep = document.getElementById('togglePreventSleep');
+const toggleAutoStart = document.getElementById('toggleAutoStart');
+
+async function loadServiceStatus() {
+  try {
+    const snap = await invoke('get_service_status');
+    if (!snap) return;
+
+    if (togglePreventSleep && document.activeElement !== togglePreventSleep) {
+      togglePreventSleep.checked = !!snap.prevent_sleep_while_hosting;
+    }
+    if (toggleAutoStart && document.activeElement !== toggleAutoStart) {
+      toggleAutoStart.checked = !!snap.auto_start_enabled;
+    }
+
+    if (snap.service_running) {
+      const modeLabel = snap.mode === 'host' ? 'Host' : snap.mode === 'client' ? 'Client' : 'Idle';
+      const phaseLabel = snap.phase || 'disconnected';
+      if (serviceStatusDot) {
+        serviceStatusDot.style.background =
+          phaseLabel === 'connected' ? '#22c55e' :
+          phaseLabel === 'reconnecting' || phaseLabel === 'connecting' ? '#f59e0b' :
+          '#38bdf8';
+      }
+      if (serviceStatusTitle) {
+        serviceStatusTitle.textContent = `Windows Service: Running (${modeLabel} • ${phaseLabel})`;
+      }
+      if (serviceLastEvent && snap.last_event) {
+        serviceLastEvent.textContent = snap.last_event;
+      }
+      if (btnInstallService) btnInstallService.style.display = 'none';
+      if (btnUninstallService) btnUninstallService.style.display = 'inline-block';
+    } else {
+      if (serviceStatusDot) serviceStatusDot.style.background = '#64748b';
+      if (serviceStatusTitle) serviceStatusTitle.textContent = 'Windows Service: Not Running (Local App Mode)';
+      if (serviceLastEvent) {
+        serviceLastEvent.textContent = 'Install Service for auto-start on boot, zero UAC popups, and sleep/Wi-Fi recovery.';
+      }
+      if (btnInstallService) btnInstallService.style.display = 'inline-block';
+      if (btnUninstallService) btnUninstallService.style.display = 'none';
+    }
+  } catch (_) {
+    // Ignore when running outside Tauri
+  }
+}
+
+if (btnInstallService) {
+  btnInstallService.addEventListener('click', async () => {
+    try {
+      btnInstallService.disabled = true;
+      btnInstallService.textContent = 'Installing...';
+      const msg = await invoke('install_windows_service');
+      alert(msg);
+      await loadServiceStatus();
+    } catch (err) {
+      alert('Service install failed: ' + err);
+    } finally {
+      btnInstallService.disabled = false;
+      btnInstallService.textContent = 'Install Service';
+    }
+  });
+}
+
+if (btnUninstallService) {
+  btnUninstallService.addEventListener('click', async () => {
+    if (!confirm('Stop and uninstall the t3Bridge background Windows Service?')) return;
+    try {
+      btnUninstallService.disabled = true;
+      btnUninstallService.textContent = 'Removing...';
+      const msg = await invoke('uninstall_windows_service');
+      alert(msg);
+      await loadServiceStatus();
+    } catch (err) {
+      alert('Service uninstall failed: ' + err);
+    } finally {
+      btnUninstallService.disabled = false;
+      btnUninstallService.textContent = 'Uninstall';
+    }
+  });
+}
+
+if (togglePreventSleep) {
+  togglePreventSleep.addEventListener('change', async () => {
+    try {
+      await invoke('set_prevent_sleep', { enabled: togglePreventSleep.checked });
+    } catch (err) {
+      console.error('set_prevent_sleep error:', err);
+    }
+  });
+}
+
+if (toggleAutoStart) {
+  toggleAutoStart.addEventListener('change', async () => {
+    try {
+      await invoke('set_auto_start', { enabled: toggleAutoStart.checked });
+    } catch (err) {
+      console.error('set_auto_start error:', err);
+    }
+  });
+}
 
 // Check for updates every 30 minutes in background
 setInterval(checkForUpdates, 30 * 60 * 1000);

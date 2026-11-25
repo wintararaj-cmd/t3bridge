@@ -31,13 +31,34 @@ pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry
     println!("[+] WebSocket connection established: {}", addr);
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<SignalingMessage>();
+    let (bin_tx, mut bin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    // Spawn outbound message pump
+    // Spawn outbound message pump (handles both JSON signaling & zero-overhead Binary relay frames)
     let pump_handle = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if let Ok(json) = serde_json::to_string(&msg) {
-                if ws_sender.send(Message::Text(json)).await.is_err() {
-                    break;
+        loop {
+            tokio::select! {
+                biased;
+                maybe_bin = bin_rx.recv() => {
+                    match maybe_bin {
+                        Some(raw_frame) => {
+                            if ws_sender.send(Message::Binary(raw_frame)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                maybe_msg = rx.recv() => {
+                    match maybe_msg {
+                        Some(msg) => {
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                if ws_sender.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        None => break,
+                    }
                 }
             }
         }
@@ -53,6 +74,7 @@ pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry
                         SignalingMessage::RegisterNode { peer_id, role, .. } => {
                             match registry.register(peer_id.clone(), role, tx.clone(), addr).await {
                                 Ok(vip) => {
+                                    registry.attach_binary_tx(&peer_id, bin_tx.clone()).await;
                                     registered_peer_id = Some(peer_id);
                                     let resp = SignalingMessage::NodeRegistered {
                                         assigned_virtual_ip: vip,
@@ -151,6 +173,13 @@ pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry
                         }
                         _ => {}
                     }
+                }
+            }
+            Ok(Message::Binary(frame)) => {
+                // Fast-path: zero-JSON, zero-Base64 encrypted relay frame forwarding
+                if let Some((session_id, _)) = t3_domain::decode_binary_relay_frame(&frame) {
+                    let sid = session_id.to_string();
+                    let _ = registry.forward_binary_relay(&sid, &bin_tx, frame).await;
                 }
             }
             Ok(Message::Close(_)) => break,

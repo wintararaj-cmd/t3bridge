@@ -7,6 +7,28 @@ pub enum PeerRole {
     ClientNode, // Branch / Home laptop accessing Marg
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TransportMode {
+    #[default]
+    Disconnected,
+    LanDirect,
+    DirectUdpP2p,
+    WsBinaryRelay,
+    WsLegacyRelay,
+}
+
+impl std::fmt::Display for TransportMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportMode::Disconnected => write!(f, "Disconnected"),
+            TransportMode::LanDirect => write!(f, "LAN Direct"),
+            TransportMode::DirectUdpP2p => write!(f, "Direct P2P (WireGuard UDP)"),
+            TransportMode::WsBinaryRelay => write!(f, "Cloud Relay (Encrypted Binary WS)"),
+            TransportMode::WsLegacyRelay => write!(f, "Cloud Relay (Legacy WS)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunnelMetrics {
     pub latency_ms: u32,

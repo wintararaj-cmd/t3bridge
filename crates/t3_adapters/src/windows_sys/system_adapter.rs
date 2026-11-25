@@ -233,9 +233,25 @@ impl WindowsSystemPort for WindowsSystemAdapter {
     }
 
     async fn configure_firewall_rule(&self, subnet_cidr: &str) -> DomainResult<()> {
-        // Enable File and Printer Sharing firewall rule group
+        // Ensure Windows SMB Server (LanmanServer) service is set to Auto and running
+        let _ = Self::hidden_command("sc")
+            .args(["config", "LanmanServer", "start=", "auto"])
+            .output();
+        let _ = Self::hidden_command("net")
+            .args(["start", "LanmanServer"])
+            .output();
+
+        // Enable File and Printer Sharing firewall rule group (both netsh & PowerShell rule IDs)
         let _ = Self::hidden_command("netsh")
             .args(["advfirewall", "firewall", "set", "rule", "group=File and Printer Sharing", "new", "enable=Yes"])
+            .output();
+        let _ = Self::hidden_command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Enable-NetFirewallRule -Name 'FPS-SMB-In-TCP','FPS-NB_Session-In-TCP','FPS-ICMP4-ERQ-In' -ErrorAction SilentlyContinue; Enable-NetFirewallRule -DisplayGroup 'File and Printer Sharing' -ErrorAction SilentlyContinue",
+            ])
             .output();
 
         // Remove old rules first to prevent duplicate entries

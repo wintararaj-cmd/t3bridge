@@ -4,13 +4,15 @@ members = [
     "crates/t3_domain",
     "crates/t3_application",
     "crates/t3_adapters",
+    "crates/t3_ipc",
+    "crates/t3_service",
     "crates/t3_licensing_tool",
     "crates/t3_signaling_server",
     "src-tauri",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["t3Bridge Team"]
 license = "Proprietary"
@@ -29,6 +31,7 @@ async-trait = "0.1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", features = ["ring"] }
 futures-util = "0.3"
+boringtun = "0.7"
 
 # Cryptography & Licensing
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }

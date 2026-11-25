@@ -7,6 +7,7 @@ use t3_domain::{Peer, PeerRole, SignalingMessage, VirtualIp};
 pub struct ConnectedPeer {
     pub peer: Peer,
     pub tx: mpsc::UnboundedSender<SignalingMessage>,
+    pub binary_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     pub remote_addr: SocketAddr,
 }
 
@@ -14,6 +15,8 @@ pub struct ConnectedPeer {
 pub struct RelayPair {
     pub client_tx: mpsc::UnboundedSender<SignalingMessage>,
     pub host_tx: mpsc::UnboundedSender<SignalingMessage>,
+    pub client_bin_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    pub host_bin_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     pub client_id: String,
     pub host_id: String,
 }
@@ -50,10 +53,28 @@ impl PeerRegistry {
         let ip_str = if role == PeerRole::HostServer {
             "10.99.0.1".to_string()
         } else {
+            let used_ips: std::collections::HashSet<String> = {
+                let map = self.peers.read().await;
+                map.values()
+                    .map(|cp| cp.peer.virtual_ip.addr().to_string())
+                    .collect()
+            };
+
             let mut suffix = self.next_ip_suffix.write().await;
-            let current = *suffix;
-            *suffix = suffix.saturating_add(1);
-            format!("10.99.0.{}", current)
+            let mut chosen = if *suffix < 2 || *suffix > 254 { 2 } else { *suffix };
+            for _ in 0..253 {
+                let candidate = format!("10.99.0.{}", chosen);
+                let next = if chosen >= 254 { 2 } else { chosen + 1 };
+                if !used_ips.contains(&candidate) {
+                    *suffix = next;
+                    break;
+                }
+                chosen = next;
+            }
+            if chosen < 2 || chosen > 254 {
+                chosen = 2;
+            }
+            format!("10.99.0.{}", chosen)
         };
 
         let vip = VirtualIp::new(&ip_str, 24)
@@ -74,11 +95,19 @@ impl PeerRegistry {
             ConnectedPeer {
                 peer,
                 tx,
+                binary_tx: None,
                 remote_addr,
             },
         );
 
         Ok(vip)
+    }
+
+    pub async fn attach_binary_tx(&self, peer_id: &str, binary_tx: mpsc::UnboundedSender<Vec<u8>>) {
+        let mut map = self.peers.write().await;
+        if let Some(cp) = map.get_mut(peer_id) {
+            cp.binary_tx = Some(binary_tx);
+        }
     }
 
     pub async fn unregister(&self, peer_id: &str, sender_tx: Option<&mpsc::UnboundedSender<SignalingMessage>>) {
@@ -130,16 +159,50 @@ impl PeerRegistry {
         host_id: String,
         host_tx: mpsc::UnboundedSender<SignalingMessage>,
     ) {
+        let (client_bin_tx, host_bin_tx) = {
+            let map = self.peers.read().await;
+            (
+                map.get(&client_id).and_then(|cp| cp.binary_tx.clone()),
+                map.get(&host_id).and_then(|cp| cp.binary_tx.clone()),
+            )
+        };
         let mut sessions = self.relay_sessions.write().await;
         sessions.insert(
             session_id,
             RelayPair {
                 client_tx,
                 host_tx,
+                client_bin_tx,
+                host_bin_tx,
                 client_id,
                 host_id,
             },
         );
+    }
+
+    /// Zero-JSON, zero-Base64 binary WebSocket frame forwarding between paired peers.
+    pub async fn forward_binary_relay(
+        &self,
+        session_id: &str,
+        sender_bin_tx: &mpsc::UnboundedSender<Vec<u8>>,
+        raw_frame: Vec<u8>,
+    ) -> bool {
+        let sessions = self.relay_sessions.read().await;
+        if let Some(pair) = sessions.get(session_id) {
+            let is_from_client = pair
+                .client_bin_tx
+                .as_ref()
+                .map(|tx| tx.same_channel(sender_bin_tx))
+                .unwrap_or(false);
+            if is_from_client {
+                if let Some(ref host_bin) = pair.host_bin_tx {
+                    return host_bin.send(raw_frame).is_ok();
+                }
+            } else if let Some(ref client_bin) = pair.client_bin_tx {
+                return client_bin.send(raw_frame).is_ok();
+            }
+        }
+        false
     }
 
     pub async fn forward_relay_data(
@@ -275,5 +338,79 @@ mod tests {
         // Unregister
         registry.unregister("BRANCH-01", None).await;
         assert_eq!(registry.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_registry_ip_wraps_within_2_to_254() {
+        let registry = PeerRegistry::new();
+        let addr: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+
+        for i in 0..260u32 {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let peer_id = format!("CLIENT-{}", i);
+            let vip = registry
+                .register(peer_id.clone(), PeerRole::ClientNode, tx, addr)
+                .await
+                .unwrap();
+            let last_octet = vip.addr().octets()[3];
+            assert!(
+                (2..=254).contains(&last_octet),
+                "Client IP {} had invalid last octet {}",
+                vip.addr(),
+                last_octet
+            );
+            registry.unregister(&peer_id, None).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_binary_relay_forwarding_bidirectional() {
+        let registry = PeerRegistry::new();
+        let addr: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+
+        let (host_tx, _host_rx) = mpsc::unbounded_channel();
+        let (host_bin_tx, mut host_bin_rx) = mpsc::unbounded_channel();
+        let (client_tx, _client_rx) = mpsc::unbounded_channel();
+        let (client_bin_tx, mut client_bin_rx) = mpsc::unbounded_channel();
+
+        registry
+            .register("HOST-1".into(), PeerRole::HostServer, host_tx.clone(), addr)
+            .await
+            .unwrap();
+        registry.attach_binary_tx("HOST-1", host_bin_tx.clone()).await;
+
+        registry
+            .register("CLIENT-1".into(), PeerRole::ClientNode, client_tx.clone(), addr)
+            .await
+            .unwrap();
+        registry
+            .attach_binary_tx("CLIENT-1", client_bin_tx.clone())
+            .await;
+
+        registry
+            .register_relay_pair(
+                "sess_bin_1".into(),
+                "CLIENT-1".into(),
+                client_tx,
+                "HOST-1".into(),
+                host_tx,
+            )
+            .await;
+
+        let frame_c2h = t3_domain::encode_binary_relay_frame("sess_bin_1", b"wg-encrypted-c2h").unwrap();
+        assert!(
+            registry
+                .forward_binary_relay("sess_bin_1", &client_bin_tx, frame_c2h.clone())
+                .await
+        );
+        assert_eq!(host_bin_rx.recv().await.unwrap(), frame_c2h);
+
+        let frame_h2c = t3_domain::encode_binary_relay_frame("sess_bin_1", b"wg-encrypted-h2c").unwrap();
+        assert!(
+            registry
+                .forward_binary_relay("sess_bin_1", &host_bin_tx, frame_h2c.clone())
+                .await
+        );
+        assert_eq!(client_bin_rx.recv().await.unwrap(), frame_h2c);
     }
 }
