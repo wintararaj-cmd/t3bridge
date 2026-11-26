@@ -1,10 +1,26 @@
 use crate::commands::AppState;
+use t3_domain::TransportMode;
 use t3_ipc::{
     send_ipc_request, ConnectionPhase, IpcRequest, IpcResponse, ServiceMode, ServiceSnapshot,
 };
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
+
+/// Checks asynchronously (with a 1500ms timeout) whether a mapped Windows drive letter
+/// is actually readable and not stuck in a stale/disconnected ("Red X") SMB state.
+async fn is_drive_accessible(letter: char) -> bool {
+    let root = format!(r"{}:\", letter.to_ascii_uppercase());
+    match tokio::time::timeout(
+        tokio::time::Duration::from_millis(1500),
+        tokio::task::spawn_blocking(move || std::fs::read_dir(&root).is_ok()),
+    )
+    .await
+    {
+        Ok(Ok(ok)) => ok,
+        _ => false,
+    }
+}
 
 pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let status_item = MenuItem::with_id(
@@ -86,11 +102,15 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 
     let tray = builder.build(app)?;
 
-    // Spawn background Tray Status + User-Session Drive Auto-Mount Sync loop
+    // Spawn background Tray Status + User-Session Drive Auto-Mount & Wake/Reconnect Remount Watchdog
     let handle = app.handle().clone();
     tauri::async_runtime::spawn(async move {
         let mut last_status_label = String::new();
         let mut mounted_unc_in_session: Option<(char, String)> = None;
+        let mut last_phase: Option<ConnectionPhase> = None;
+        let mut last_seen_reconnect_event: Option<String> = None;
+        let mut needs_remount = false;
+        let mut accessibility_tick: u32 = 0;
 
         loop {
             let snap_opt = match send_ipc_request(&IpcRequest::GetStatus).await {
@@ -130,9 +150,30 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 last_status_label = label;
             }
 
-            // User-Session (Session 1) Drive Auto-Mount & Safe Sleep/Disconnect Unmount
+            // User-Session (Session 1) Drive Auto-Mount, Auto-Remount on Wake/Network Switch & Safe Sleep Unmount
             if let Some(snap) = snap_opt {
                 let state = handle.state::<AppState>();
+
+                // Detect any transition through Reconnecting/Connecting/Suspended or fast reconnect event
+                if matches!(
+                    last_phase,
+                    Some(ConnectionPhase::Reconnecting)
+                        | Some(ConnectionPhase::Connecting)
+                        | Some(ConnectionPhase::Suspended)
+                ) && snap.phase == ConnectionPhase::Connected
+                {
+                    needs_remount = true;
+                }
+                if let Some(ref ev) = snap.last_event {
+                    if ev.starts_with("Reconnected successfully")
+                        && last_seen_reconnect_event.as_deref() != Some(ev.as_str())
+                    {
+                        last_seen_reconnect_event = Some(ev.clone());
+                        needs_remount = true;
+                    }
+                }
+                last_phase = Some(snap.phase);
+
                 match (snap.mode, snap.phase) {
                     (ServiceMode::Client, ConnectionPhase::Connected) => {
                         if let (Some(server_ip), Some(share), Some(letter)) = (
@@ -143,25 +184,38 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                             let clean_share = share.trim().trim_matches('\\').trim_matches('/');
                             if !clean_share.is_empty() {
                                 let desired_unc = format!(r"\\{}\{}", server_ip, clean_share);
-                                let already_mounted = mounted_unc_in_session
+                                let matches_session = mounted_unc_in_session
                                     .as_ref()
                                     .map(|(l, u)| *l == letter && u == &desired_unc)
                                     .unwrap_or(false)
                                     && state.system.is_drive_in_use(letter).await.unwrap_or(false);
 
-                                if !already_mounted {
+                                // Every ~15s (6 polls), probe actual SMB drive readability to catch stale Red-X handles
+                                accessibility_tick = accessibility_tick.wrapping_add(1);
+                                if matches_session && !needs_remount && accessibility_tick % 6 == 0 {
+                                    if !is_drive_accessible(letter).await {
+                                        needs_remount = true;
+                                    }
+                                }
+
+                                if !matches_session || needs_remount {
                                     if state.system.mount_drive(letter, &desired_unc).await.is_ok() {
                                         mounted_unc_in_session = Some((letter, desired_unc.clone()));
                                         *state.active_drive.lock().await = Some(letter);
                                         *state.active_unc.lock().await = Some(desired_unc);
                                         *state.is_connected.lock().await = true;
+                                        needs_remount = false;
                                     }
                                 }
                             }
                         }
                     }
+                    (_, ConnectionPhase::Reconnecting) => {
+                        needs_remount = true;
+                    }
                     (_, ConnectionPhase::Suspended) | (_, ConnectionPhase::Disconnected) => {
                         // Rule 5.3 Anti-Corruption: cleanly unmount user-session drive on Sleep or Disconnect
+                        needs_remount = false;
                         if let Some((letter, _)) = mounted_unc_in_session.take() {
                             let _ = state.system.unmount_drive(letter).await;
                             *state.active_drive.lock().await = None;
@@ -184,13 +238,27 @@ fn format_tray_status(
     snap: &ServiceSnapshot,
     mounted: Option<&(char, String)>,
 ) -> (String, String) {
+    let mode_tag = |m: TransportMode| -> &'static str {
+        match m {
+            TransportMode::DirectUdpP2p => "Direct UDP",
+            TransportMode::LanDirect => "LAN Direct",
+            TransportMode::WsBinaryRelay => "Cloud Relay",
+            TransportMode::WsLegacyRelay => "Legacy Relay",
+            TransportMode::Disconnected => "Idle",
+        }
+    };
+
     match (snap.mode, snap.phase) {
         (ServiceMode::Host, ConnectionPhase::Connected) => {
             let code = &snap.host.host_code;
             let nodes = snap.host.active_nodes;
+            let m = mode_tag(snap.host.transport_mode);
             (
-                format!("Status: Connected — Host ({}, {} clients)", code, nodes),
-                format!("t3Bridge Host Connected ({})\nActive clients: {}", code, nodes),
+                format!("Status: Host ({}, {} clients • {})", code, nodes, m),
+                format!(
+                    "t3Bridge Host Connected ({})\nActive clients: {} ({})",
+                    code, nodes, m
+                ),
             )
         }
         (ServiceMode::Client, ConnectionPhase::Connected) => {
@@ -202,9 +270,15 @@ fn format_tray_status(
                 .target_peer_id
                 .as_deref()
                 .unwrap_or("Host");
+            let m = mode_tag(snap.client.transport_mode);
+            let rtt = if snap.client.latency_ms > 0 {
+                format!(" • {} ms", snap.client.latency_ms)
+            } else {
+                String::new()
+            };
             (
-                format!("Status: Connected — {} ({})", target, drive_info),
-                format!("t3Bridge Connected to {}\n{}", target, drive_info),
+                format!("Status: {} ({} • {}{})", target, drive_info, m, rtt),
+                format!("t3Bridge Connected to {}\n{} • {}{}", target, drive_info, m, rtt),
             )
         }
         (_, ConnectionPhase::Connecting) => (
