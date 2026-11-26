@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use t3_application::ports::WindowsSystemPort;
 use t3_domain::{DomainError, DomainResult};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(windows)]
@@ -228,6 +228,71 @@ impl WindowsSystemAdapter {
     pub fn apply_smb_server_wan_tuning() {
         Self::apply_registry_dword_entries(smb_server_wan_tuning_entries());
     }
+
+    /// Adds Windows Defender Firewall inbound & outbound UDP allow rules for `t3bridge-service.exe`
+    /// and `t3bridge_ui.exe` so Direct WireGuard UDP P2P packets are never silently blocked.
+    pub fn allow_p2p_udp_firewall_rules() {
+        let Ok(current_exe) = std::env::current_exe() else {
+            return;
+        };
+        let exe_paths = collect_firewall_udp_program_paths(&current_exe);
+        for (idx, exe_path) in exe_paths.iter().enumerate() {
+            let rule_in = format!("t3Bridge-P2P-UDP-In-{}", idx);
+            let rule_out = format!("t3Bridge-P2P-UDP-Out-{}", idx);
+            let prog_arg = format!("program={}", exe_path.display());
+
+            let _ = Self::hidden_command("netsh")
+                .args(["advfirewall", "firewall", "delete", "rule", &format!("name={}", rule_in)])
+                .output();
+            let _ = Self::hidden_command("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    &format!("name={}", rule_in),
+                    "dir=in",
+                    "action=allow",
+                    "protocol=UDP",
+                    &prog_arg,
+                    "profile=any",
+                ])
+                .output();
+
+            let _ = Self::hidden_command("netsh")
+                .args(["advfirewall", "firewall", "delete", "rule", &format!("name={}", rule_out)])
+                .output();
+            let _ = Self::hidden_command("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    &format!("name={}", rule_out),
+                    "dir=out",
+                    "action=allow",
+                    "protocol=UDP",
+                    &prog_arg,
+                    "profile=any",
+                ])
+                .output();
+        }
+    }
+}
+
+/// Collects deduplicated executable paths (current binary + sibling t3Bridge binaries that exist)
+/// for Windows Firewall UDP allow rules.
+pub(crate) fn collect_firewall_udp_program_paths(current_exe: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![current_exe.to_path_buf()];
+    if let Some(dir) = current_exe.parent() {
+        for sibling_name in ["t3bridge-service.exe", "t3bridge_ui.exe", "t3Bridge.exe"] {
+            let candidate = dir.join(sibling_name);
+            if candidate.exists() && !paths.iter().any(|p| p == &candidate) {
+                paths.push(candidate);
+            }
+        }
+    }
+    paths
 }
 
 impl Default for WindowsSystemAdapter {
@@ -352,6 +417,8 @@ impl WindowsSystemPort for WindowsSystemAdapter {
     async fn configure_firewall_rule(&self, subnet_cidr: &str) -> DomainResult<()> {
         // Apply SMB Server WAN & DBF throughput registry tuning on Host PCs
         Self::apply_smb_server_wan_tuning();
+        // Allow inbound & outbound Direct UDP P2P traffic for t3Bridge executables
+        Self::allow_p2p_udp_firewall_rules();
 
         // Ensure Windows SMB Server (LanmanServer) service is set to Auto and running
         let _ = Self::hidden_command("sc")
@@ -533,5 +600,13 @@ The command completed successfully.
         assert_eq!(find("AsynchronousCredits"), Some(512));
         assert_eq!(find("DisableStrictNameChecking"), Some(1));
         assert!(entries.iter().all(|e| e.key == LANMAN_SERVER_PARAMS_KEY));
+    }
+
+    #[test]
+    fn test_collect_firewall_udp_program_paths_includes_current_exe() {
+        let cur = std::env::current_exe().unwrap();
+        let paths = collect_firewall_udp_program_paths(&cur);
+        assert!(!paths.is_empty());
+        assert_eq!(paths[0], cur);
     }
 }

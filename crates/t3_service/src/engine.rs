@@ -456,8 +456,8 @@ impl ServiceEngine {
             .await
             .map_err(|e| format!("Failed to start host virtual network adapter: {}", e))?;
 
-        // Initialize single-socket STUN + WireGuard P2P UDP listener
-        let (host_public_ep, host_local_cand) = self.tunnel.init_p2p_udp().await;
+        // Initialize single-socket STUN + WireGuard P2P UDP listener (auto-refreshes STUN every 25s)
+        let (_initial_public_ep, _initial_local_cand) = self.tunnel.init_p2p_udp().await;
         let host_wg_pubkey = self.tunnel.local_wg_pubkey_b64();
         if let Some(bin_tx) = client.get_binary_sender().await {
             self.tunnel.set_binary_relay_channel(bin_tx);
@@ -661,15 +661,17 @@ impl ServiceEngine {
                                 local_shares.insert(0, share_for_pump.clone());
                             }
                             let shares_csv = local_shares.join(",");
+                            let (fresh_public_ep, fresh_local_cand) =
+                                tunnel_for_host.current_p2p_endpoints();
                             let answer = HolePunchPayload {
                                 peer_id: host_code_for_pump.clone(),
-                                public_endpoint: host_public_ep.clone(),
+                                public_endpoint: fresh_public_ep,
                                 wireguard_pubkey: t3_domain::format_host_answer_meta(
                                     &token,
                                     &host_wg_pubkey,
                                     &shares_csv,
                                 ),
-                                local_candidate: host_local_cand.clone(),
+                                local_candidate: fresh_local_cand,
                             };
                             let _ = tx.send(SignalingMessage::HolePunchAnswer {
                                 target_peer_id: offer.peer_id,

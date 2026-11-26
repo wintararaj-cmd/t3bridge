@@ -1,6 +1,8 @@
 use crate::nat::StunClientAdapter;
 use crate::tunnel::packet_filter::{clamp_tcp_mss, extract_routable_ipv4_dst};
-use crate::tunnel::wireguard_peer::{WgPeerSession, WireGuardKeypair};
+use crate::tunnel::wireguard_peer::{
+    decode_p2p_probe, P2pProbeKind, WgPeerSession, WireGuardKeypair,
+};
 use crate::windows_sys::WindowsSystemAdapter;
 use async_trait::async_trait;
 use rand::RngCore;
@@ -78,6 +80,25 @@ fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
 
 type PeerMap = HashMap<Ipv4Addr, Arc<std::sync::Mutex<WgPeerSession>>>;
 
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn direct_active_has_target(
+    is_direct: bool,
+    direct_ep: Option<SocketAddr>,
+    candidates: &[SocketAddr],
+) -> bool {
+    if is_direct {
+        direct_ep.is_some()
+    } else {
+        !candidates.is_empty()
+    }
+}
+
 pub struct WintunTunnelAdapter {
     wintun_dll_path: Option<PathBuf>,
     is_active: Arc<AtomicBool>,
@@ -90,6 +111,9 @@ pub struct WintunTunnelAdapter {
     adapter: Arc<Mutex<Option<Arc<wintun::Adapter>>>>,
     udp_socket: Arc<Mutex<Option<Arc<UdpSocket>>>>,
     p2p_udp_socket: Arc<std::sync::RwLock<Option<Arc<UdpSocket>>>>,
+    cached_public_ep: Arc<std::sync::RwLock<String>>,
+    cached_local_cand: Arc<std::sync::RwLock<Option<String>>>,
+    active_stun_tx_id: Arc<std::sync::Mutex<Option<[u8; 12]>>>,
     wg_keypair: Arc<WireGuardKeypair>,
     wg_peers: Arc<std::sync::RwLock<PeerMap>>,
     session_to_vip: Arc<std::sync::RwLock<HashMap<String, Ipv4Addr>>>,
@@ -104,13 +128,16 @@ impl WintunTunnelAdapter {
             is_active: Arc::new(AtomicBool::new(false)),
             bytes_sent: Arc::new(AtomicU64::new(0)),
             bytes_received: Arc::new(AtomicU64::new(0)),
-            latency_ms: Arc::new(AtomicU32::new(15)),
+            latency_ms: Arc::new(AtomicU32::new(0)),
             outbound_tx: Arc::new(std::sync::RwLock::new(None)),
             binary_relay_tx: Arc::new(std::sync::RwLock::new(None)),
             session: Arc::new(std::sync::RwLock::new(None)),
             adapter: Arc::new(Mutex::new(None)),
             udp_socket: Arc::new(Mutex::new(None)),
             p2p_udp_socket: Arc::new(std::sync::RwLock::new(None)),
+            cached_public_ep: Arc::new(std::sync::RwLock::new("0.0.0.0:0".into())),
+            cached_local_cand: Arc::new(std::sync::RwLock::new(None)),
+            active_stun_tx_id: Arc::new(std::sync::Mutex::new(None)),
             wg_keypair: Arc::new(WireGuardKeypair::generate()),
             wg_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             session_to_vip: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -127,6 +154,29 @@ impl WintunTunnelAdapter {
     /// Returns this node's base64-encoded WireGuard X25519 public key.
     pub fn local_wg_pubkey_b64(&self) -> String {
         self.wg_keypair.public_key_b64()
+    }
+
+    /// Returns the most recently STUN-refreshed `(public_endpoint, local_candidate)` for this UDP socket.
+    pub fn current_p2p_endpoints(&self) -> (String, Option<String>) {
+        let pub_ep = self
+            .cached_public_ep
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "0.0.0.0:0".into());
+        let local = self
+            .cached_local_cand
+            .read()
+            .ok()
+            .and_then(|g| g.clone());
+        (pub_ep, local)
+    }
+
+    /// Returns the currently bound local UDP port for the P2P socket, if initialized.
+    pub fn local_udp_port(&self) -> Option<u16> {
+        self.p2p_udp_socket
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()))
     }
 
     /// Returns the currently active WAN transport mode across registered WireGuard peers.
@@ -201,15 +251,26 @@ impl WintunTunnelAdapter {
             }
         }
 
+        if let Ok(mut guard) = self.cached_public_ep.write() {
+            *guard = public_endpoint.clone();
+        }
+        if let Ok(mut guard) = self.cached_local_cand.write() {
+            *guard = local_candidate.clone();
+        }
         if let Ok(mut guard) = self.p2p_udp_socket.write() {
             *guard = Some(Arc::clone(&sock));
         }
 
-        // 1. Spawn UDP Inbound Receiver Task (handles WireGuard decrypt + NAT roaming + direct promotion)
+        // 1. Spawn UDP Inbound Receiver Task
+        //    Handles: (a) STUN keepalive refresh responses, (b) Authenticated UDP P2P_PING/P2P_PONG
+        //    for instant Direct UDP promotion + live RTT, (c) WireGuard data packets & NAT roaming.
         let sock_rx = Arc::clone(&sock);
         let peers_rx = Arc::clone(&self.wg_peers);
         let session_rx = Arc::clone(&self.session);
         let bytes_rx = Arc::clone(&self.bytes_received);
+        let latency_rx = Arc::clone(&self.latency_ms);
+        let stun_tx_rx = Arc::clone(&self.active_stun_tx_id);
+        let cached_pub_rx = Arc::clone(&self.cached_public_ep);
         let gen_rx = Arc::clone(&self.p2p_gen);
 
         tokio::spawn(async move {
@@ -228,6 +289,20 @@ impl WintunTunnelAdapter {
                 }
 
                 let packet = &buf[..len];
+
+                // (a) Check if this packet is a STUN Binding Response (refreshes cached public IP:Port)
+                if len >= 20 && packet[0] == 0x01 && packet[1] == 0x01 {
+                    let expected_tx = stun_tx_rx.lock().ok().and_then(|g| *g);
+                    if let Some(tx_id) = expected_tx {
+                        if let Ok(addr) = StunClientAdapter::parse_binding_response(packet, &tx_id) {
+                            if let Ok(mut g) = cached_pub_rx.write() {
+                                *g = addr.to_string();
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 let peer_list: Vec<Arc<std::sync::Mutex<WgPeerSession>>> = {
                     match peers_rx.read() {
                         Ok(map) => map.values().cloned().collect(),
@@ -235,6 +310,42 @@ impl WintunTunnelAdapter {
                     }
                 };
 
+                // (b) Check for authenticated UDP-only P2P_PING / P2P_PONG probe
+                //     (Bypasses boringtun anti-replay counters so Direct UDP promotes reliably!)
+                if let Some((probe_kind, probe_token, ts_ms)) = decode_p2p_probe(packet) {
+                    if matches!(probe_kind, P2pProbeKind::UdpPing | P2pProbeKind::UdpPong) {
+                        for peer_mtx in peer_list {
+                            let reply_opt = match peer_mtx.lock() {
+                                Ok(mut peer) => {
+                                    if peer.matches_probe_token(&probe_token) {
+                                        peer.mark_direct_rx(src);
+                                        if probe_kind == P2pProbeKind::UdpPing {
+                                            Some(peer.build_probe(P2pProbeKind::UdpPong, ts_ms))
+                                        } else {
+                                            let rtt = now_epoch_ms()
+                                                .saturating_sub(ts_ms)
+                                                .clamp(1, 5000)
+                                                as u32;
+                                            latency_rx.store(rtt, Ordering::Relaxed);
+                                            None
+                                        }
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                Err(_) => continue,
+                            };
+
+                            if let Some(pong) = reply_opt {
+                                let _ = sock_rx.send_to(&pong, src).await;
+                            }
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                // (c) Standard WireGuard encrypted datagram
                 for peer_mtx in peer_list {
                     let decap = {
                         match peer_mtx.lock() {
@@ -262,10 +373,11 @@ impl WintunTunnelAdapter {
             }
         });
 
-        // 2. Spawn WireGuard Timer & Direct-Path Re-probe Task (250ms tick)
+        // 2. Spawn WireGuard Timer, UDP-First Promotion Probe, Live RTT & 25s STUN Keepalive Task (250ms tick)
         let sock_timer = Arc::clone(&sock);
         let peers_timer = Arc::clone(&self.wg_peers);
         let bin_tx_timer = Arc::clone(&self.binary_relay_tx);
+        let stun_tx_timer = Arc::clone(&self.active_stun_tx_id);
         let gen_timer = Arc::clone(&self.p2p_gen);
 
         tokio::spawn(async move {
@@ -275,6 +387,18 @@ impl WintunTunnelAdapter {
                 interval.tick().await;
                 tick_count = tick_count.wrapping_add(1);
 
+                // Every 25s (100 ticks), refresh STUN binding on this exact UDP socket
+                // so Host & Client NAT pinholes never expire while idle!
+                if tick_count % 100 == 0 {
+                    let mut tx_id = [0u8; 12];
+                    rand::thread_rng().fill_bytes(&mut tx_id);
+                    if let Ok(mut g) = stun_tx_timer.lock() {
+                        *g = Some(tx_id);
+                    }
+                    let req = StunClientAdapter::build_binding_request(&tx_id);
+                    let _ = sock_timer.send_to(&req, STUN_SERVERS[0]).await;
+                }
+
                 let peer_list: Vec<Arc<std::sync::Mutex<WgPeerSession>>> = {
                     match peers_timer.read() {
                         Ok(map) => map.values().cloned().collect(),
@@ -282,28 +406,58 @@ impl WintunTunnelAdapter {
                     }
                 };
 
+                let now_ms = now_epoch_ms();
+
                 for peer_mtx in peer_list {
-                    let (timer_pkt, direct_active, direct_ep, candidates, session_id, reprobe_pkt) = {
+                    let (
+                        timer_pkt,
+                        direct_active,
+                        direct_ep,
+                        candidates,
+                        session_id,
+                        udp_ping_pkt,
+                        relay_ping_pkt,
+                    ) = {
                         match peer_mtx.lock() {
                             Ok(mut peer) => {
                                 let t_pkt = peer.tick_timers();
                                 let is_direct = peer.is_direct_udp_active();
-                                // Every 20s (80 ticks), if still on relay fallback, re-probe direct UDP
-                                let reprobe = if !is_direct
-                                    && tick_count % 80 == 0
-                                    && !peer.candidates.is_empty()
+
+                                // UDP-First Discovery + Keepalive schedule:
+                                // - First 12s while not direct: send UDP_PING every 500ms (2 ticks)
+                                // - After 12s while not direct: retry UDP_PING every 5s (20 ticks)
+                                // - While direct: send UDP_PING every 5s (20 ticks) for NAT keepalive + live RTT
+                                let should_udp_ping = if is_direct {
+                                    tick_count % 20 == 0
+                                } else if peer.created_at.elapsed() < Duration::from_secs(12) {
+                                    tick_count % 2 == 0
+                                } else {
+                                    tick_count % 20 == 0
+                                };
+
+                                let udp_ping = if should_udp_ping
+                                    && (direct_active_has_target(is_direct, peer.direct_endpoint, &peer.candidates))
                                 {
-                                    peer.initiate_handshake(false)
+                                    Some(peer.build_probe(P2pProbeKind::UdpPing, now_ms))
                                 } else {
                                     None
                                 };
+
+                                // Measure real Cloud Relay RTT every 5s while falling back to Relay
+                                let relay_ping = if !is_direct && tick_count % 20 == 0 {
+                                    Some(peer.build_probe(P2pProbeKind::RelayPing, now_ms))
+                                } else {
+                                    None
+                                };
+
                                 (
                                     t_pkt,
                                     is_direct,
                                     peer.direct_endpoint,
                                     peer.candidates.clone(),
                                     peer.session_id.clone(),
-                                    reprobe,
+                                    udp_ping,
+                                    relay_ping,
                                 )
                             }
                             Err(_) => continue,
@@ -316,18 +470,24 @@ impl WintunTunnelAdapter {
                                 let _ = sock_timer.send_to(&pkt, ep).await;
                             }
                         } else {
-                            for cand in &candidates {
-                                let _ = sock_timer.send_to(&pkt, cand).await;
-                            }
                             send_binary_fallback(&bin_tx_timer, &session_id, &pkt);
                         }
                     }
 
-                    if let Some(rpkt) = reprobe_pkt {
-                        for cand in &candidates {
-                            let _ = sock_timer.send_to(HOLE_PUNCH_PROBE, cand).await;
-                            let _ = sock_timer.send_to(&rpkt, cand).await;
+                    if let Some(ping) = udp_ping_pkt {
+                        if direct_active {
+                            if let Some(ep) = direct_ep {
+                                let _ = sock_timer.send_to(&ping, ep).await;
+                            }
+                        } else {
+                            for cand in &candidates {
+                                let _ = sock_timer.send_to(&ping, cand).await;
+                            }
                         }
+                    }
+
+                    if let Some(rping) = relay_ping_pkt {
+                        send_binary_fallback(&bin_tx_timer, &session_id, &rping);
                     }
                 }
             }
@@ -362,6 +522,9 @@ impl WintunTunnelAdapter {
         } else {
             None
         };
+        let now_ms = now_epoch_ms();
+        let udp_ping = peer.build_probe(P2pProbeKind::UdpPing, now_ms);
+        let relay_ping = peer.build_probe(P2pProbeKind::RelayPing, now_ms);
 
         let peer_arc = Arc::new(std::sync::Mutex::new(peer));
         if let Ok(mut map) = self.wg_peers.write() {
@@ -371,7 +534,8 @@ impl WintunTunnelAdapter {
             s2v.insert(session_id.clone(), virtual_ip);
         }
 
-        // Fire hole-punch burst + initial handshake over direct UDP candidates
+        // UDP-First: fire authenticated UDP P2P_PING burst to all candidates immediately
+        // (opens NAT pinhole and promotes to Direct UDP P2P without boringtun duplicate-nonce collisions)
         let maybe_sock = self
             .p2p_udp_socket
             .read()
@@ -381,18 +545,17 @@ impl WintunTunnelAdapter {
         if let Some(sock) = maybe_sock {
             for cand in &candidates {
                 for _ in 0..3 {
-                    let _ = sock.send_to(HOLE_PUNCH_PROBE, cand).await;
-                }
-                if let Some(ref pkt) = init_pkt {
-                    let _ = sock.send_to(pkt, cand).await;
+                    let _ = sock.send_to(&udp_ping, cand).await;
                 }
             }
         }
 
-        // Also send handshake via Binary WS fallback so connection establishes immediately even behind Symmetric NAT
+        // Establish WireGuard handshake + initial RTT measurement over Binary WS fallback
+        // so SMB works immediately even if both peers are behind Symmetric CGNAT
         if let Some(pkt) = init_pkt {
             send_binary_fallback(&self.binary_relay_tx, &session_id, &pkt);
         }
+        send_binary_fallback(&self.binary_relay_tx, &session_id, &relay_ping);
 
         Ok(())
     }
@@ -437,18 +600,43 @@ impl WintunTunnelAdapter {
             return;
         };
 
-        let (decap, direct_ep, candidates, direct_active) = match peer_mtx.lock() {
+        // Handle out-of-band Relay RTT probes without touching boringtun or promoting Direct UDP
+        if let Some((probe_kind, probe_token, ts_ms)) = decode_p2p_probe(payload) {
+            if matches!(probe_kind, P2pProbeKind::RelayPing | P2pProbeKind::RelayPong) {
+                let maybe_pong = match peer_mtx.lock() {
+                    Ok(mut peer) => {
+                        if peer.matches_probe_token(&probe_token) {
+                            peer.mark_relay_rx();
+                            if probe_kind == P2pProbeKind::RelayPing {
+                                Some(peer.build_probe(P2pProbeKind::RelayPong, ts_ms))
+                            } else {
+                                if !peer.is_direct_udp_active() {
+                                    let rtt =
+                                        now_epoch_ms().saturating_sub(ts_ms).clamp(1, 5000) as u32;
+                                    self.latency_ms.store(rtt, Ordering::Relaxed);
+                                }
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                };
+                if let Some(pong) = maybe_pong {
+                    send_binary_fallback(&self.binary_relay_tx, session_id, &pong);
+                }
+            }
+            return;
+        }
+
+        let (decap, direct_ep, direct_active) = match peer_mtx.lock() {
             Ok(mut peer) => {
                 let out = peer.decapsulate_wg(None, payload);
                 if out.authenticated {
                     peer.mark_relay_rx();
                 }
-                (
-                    out,
-                    peer.direct_endpoint,
-                    peer.candidates.clone(),
-                    peer.is_direct_udp_active(),
-                )
+                (out, peer.direct_endpoint, peer.is_direct_udp_active())
             }
             Err(_) => return,
         };
@@ -459,18 +647,11 @@ impl WintunTunnelAdapter {
             }
             let maybe_sock = self.p2p_udp_socket.read().ok().and_then(|g| g.clone());
             for reply in decap.network_replies {
-                if let Some(ref sock) = maybe_sock {
-                    if direct_active {
-                        if let Some(ep) = direct_ep {
-                            let _ = sock.try_send_to(&reply, ep);
-                        }
-                    } else {
-                        for cand in &candidates {
-                            let _ = sock.try_send_to(&reply, *cand);
-                        }
+                if direct_active {
+                    if let (Some(ref sock), Some(ep)) = (&maybe_sock, direct_ep) {
+                        let _ = sock.try_send_to(&reply, ep);
                     }
-                }
-                if !direct_active {
+                } else {
                     send_binary_fallback(&self.binary_relay_tx, session_id, &reply);
                 }
             }
@@ -747,6 +928,8 @@ impl TunnelPort for WintunTunnelAdapter {
         // Apply SMB Client WAN & DBF/ERP Registry Tuning (Guest Auth, DisableBandwidthThrottling,
         // DisableLargeMtu=0, metadata cache capacities, MaxCmds) while running under elevated/SYSTEM context
         WindowsSystemAdapter::apply_smb_client_wan_tuning();
+        // Ensure Windows Firewall allows Direct UDP P2P packets on both Host and Client
+        WindowsSystemAdapter::allow_p2p_udp_firewall_rules();
 
         let mut reg_cmd2 = Command::new("reg");
         #[cfg(windows)]
@@ -837,7 +1020,6 @@ impl TunnelPort for WintunTunnelAdapter {
                                                 wg_pkt,
                                                 peer.is_direct_udp_active(),
                                                 peer.direct_endpoint,
-                                                peer.candidates.clone(),
                                                 peer.session_id.clone(),
                                             )
                                         }),
@@ -845,24 +1027,17 @@ impl TunnelPort for WintunTunnelAdapter {
                                     }
                                 };
 
-                                if let Some((wg_pkt, direct_active, direct_ep, candidates, sid)) =
-                                    send_plan
-                                {
-                                    let sock_opt =
-                                        p2p_sock_ref.read().ok().and_then(|g| g.clone());
+                                if let Some((wg_pkt, direct_active, direct_ep, sid)) = send_plan {
                                     if direct_active {
-                                        // Direct P2P UDP active: zero bytes go to Render!
+                                        // Direct P2P UDP active: 100% peer-to-peer, zero bytes go to Cloud Relay!
+                                        let sock_opt =
+                                            p2p_sock_ref.read().ok().and_then(|g| g.clone());
                                         if let (Some(sock), Some(ep)) = (sock_opt, direct_ep) {
                                             let _ = sock.try_send_to(&wg_pkt, ep);
                                         }
                                     } else {
-                                        // Still punching NAT or behind Symmetric NAT:
-                                        // send to UDP candidates AND Binary WS fallback simultaneously
-                                        if let Some(sock) = sock_opt {
-                                            for cand in &candidates {
-                                                let _ = sock.try_send_to(&wg_pkt, *cand);
-                                            }
-                                        }
+                                        // Relay Fallback while UDP P2P_PING probes negotiate direct NAT path
+                                        // (avoids duplicating WireGuard nonces across both paths)
                                         send_binary_fallback(&bin_tx_ref, &sid, &wg_pkt);
                                     }
                                 }
@@ -940,6 +1115,16 @@ impl TunnelPort for WintunTunnelAdapter {
         if let Ok(mut guard) = self.binary_relay_tx.write() {
             *guard = None;
         }
+        if let Ok(mut guard) = self.cached_public_ep.write() {
+            *guard = "0.0.0.0:0".into();
+        }
+        if let Ok(mut guard) = self.cached_local_cand.write() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.active_stun_tx_id.lock() {
+            *guard = None;
+        }
+        self.latency_ms.store(0, Ordering::Relaxed);
 
         Ok(())
     }
@@ -990,5 +1175,74 @@ mod tests {
 
         let fatal = std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad fd");
         assert!(!is_transient_udp_recv_error(&fatal));
+    }
+
+    #[tokio::test]
+    async fn test_udp_first_promotion_works_even_with_one_sided_symmetric_nat() {
+        let host = WintunTunnelAdapter::new();
+        let client = WintunTunnelAdapter::new();
+        host.is_active.store(true, Ordering::SeqCst);
+        client.is_active.store(true, Ordering::SeqCst);
+
+        let _ = host.init_p2p_udp().await;
+        let _ = client.init_p2p_udp().await;
+
+        let host_port = host.local_udp_port().expect("host UDP port bound");
+        let host_loopback: SocketAddr = format!("127.0.0.1:{}", host_port).parse().unwrap();
+
+        let session_id = "sess_tok_e2e_udp_first".to_string();
+
+        // Simulate one-sided Symmetric NAT:
+        // Host does NOT know Client's real UDP port (candidates = empty!),
+        // only Client knows Host's endpoint. Client's P2P_PING must teach Host
+        // Client's real source address and promote BOTH sides to DirectUdpP2p!
+        host.register_wg_peer(
+            Ipv4Addr::new(10, 99, 0, 2),
+            session_id.clone(),
+            &client.local_wg_pubkey_b64(),
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+
+        client
+            .register_wg_peer(
+                Ipv4Addr::new(10, 99, 0, 1),
+                session_id.clone(),
+                &host.local_wg_pubkey_b64(),
+                vec![host_loopback],
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Wait up to 1.5s for UDP_PING -> UDP_PONG roundtrip
+        let mut promoted = false;
+        for _ in 0..30 {
+            if host.active_transport_mode() == TransportMode::DirectUdpP2p
+                && client.active_transport_mode() == TransportMode::DirectUdpP2p
+            {
+                promoted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            promoted,
+            "Expected both peers to promote to DirectUdpP2p (host={:?}, client={:?})",
+            host.active_transport_mode(),
+            client.active_transport_mode()
+        );
+        let client_metrics = client.get_metrics().await.unwrap();
+        assert!(
+            client_metrics.latency_ms >= 1,
+            "Expected live measured RTT >= 1ms, got {}",
+            client_metrics.latency_ms
+        );
+
+        let _ = host.disconnect().await;
+        let _ = client.disconnect().await;
     }
 }

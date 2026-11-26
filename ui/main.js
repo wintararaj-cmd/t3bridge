@@ -560,11 +560,11 @@ if (btnGoToLicense) {
 function formatTransportDisplay(modeCode, fallbackLabel) {
   switch (modeCode) {
     case 'direct_udp_p2p':
-      return { short: '⚡ Direct UDP P2P', cls: 'transport-p2p', badgeCls: 'badge-success', anim: '✓ CONNECTED • DIRECT UDP P2P' };
+      return { short: '⚡ Direct UDP', cls: 'transport-p2p', badgeCls: 'badge-success', anim: '✓ CONNECTED • DIRECT UDP P2P' };
     case 'lan_direct':
       return { short: '🏠 LAN Direct', cls: 'transport-p2p', badgeCls: 'badge-success', anim: '✓ CONNECTED • LAN DIRECT' };
     case 'ws_binary_relay':
-      return { short: '☁️ Cloud Relay (WS)', cls: 'transport-relay', badgeCls: 'badge-warning', anim: '✓ CONNECTED • CLOUD RELAY (BINARY WS)' };
+      return { short: '☁️ Cloud Relay', cls: 'transport-relay', badgeCls: 'badge-warning', anim: '✓ CONNECTED • CLOUD RELAY (BINARY WS)' };
     case 'ws_legacy_relay':
       return { short: '☁️ Legacy Relay', cls: 'transport-legacy', badgeCls: 'badge-warning', anim: '✓ CONNECTED • CLOUD RELAY (LEGACY)' };
     default:
@@ -592,7 +592,7 @@ function updateUiStatus(status) {
       metricTransport.title = status.transport_mode_label || transport.short;
       metricTransport.className = `metric-value ${transport.cls}`;
     }
-    metricLatency.textContent = `${status.latency_ms} ms`;
+    metricLatency.textContent = status.latency_ms > 0 ? `${status.latency_ms} ms` : '-- ms';
     metricIp.textContent = status.target_ip || "10.99.0.1";
     metricPath.textContent = status.mapped_unc || `${status.drive_letter || 'Z'}:`;
 

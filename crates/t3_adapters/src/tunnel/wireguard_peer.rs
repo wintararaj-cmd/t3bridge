@@ -2,13 +2,87 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use t3_domain::TransportMode;
 
 /// Direct UDP P2P is considered active if we received a valid authenticated
-/// WireGuard datagram directly over UDP within this window.
-const DIRECT_UDP_FRESH_WINDOW: Duration = Duration::from_secs(30);
+/// WireGuard datagram or authenticated UDP P2P probe within this window.
+/// (Active peers exchange UDP keepalive probes every 5s; if UDP drops, failover
+/// to Binary WS Relay happens automatically after 20s.)
+const DIRECT_UDP_FRESH_WINDOW: Duration = Duration::from_secs(20);
+
+/// Wire magic prefix (`"T3"`) for authenticated out-of-band P2P/Relay probes.
+/// First byte `0x54` never collides with WireGuard message types (`0x01..=0x04`)
+/// or STUN packets (`0x00`/`0x01`).
+pub const P2P_PROBE_MAGIC: [u8; 2] = [0x54, 0x33];
+pub const P2P_PROBE_LEN: usize = 27;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum P2pProbeKind {
+    UdpPing = 1,
+    UdpPong = 2,
+    RelayPing = 3,
+    RelayPong = 4,
+}
+
+impl P2pProbeKind {
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(Self::UdpPing),
+            2 => Some(Self::UdpPong),
+            3 => Some(Self::RelayPing),
+            4 => Some(Self::RelayPong),
+            _ => None,
+        }
+    }
+}
+
+/// Derives a symmetric 16-byte probe authentication token from `session_id` and both
+/// peers' X25519 public keys (sorted lexicographically so Host & Client derive the exact same token).
+pub fn derive_p2p_probe_token(session_id: &str, pub_a: &[u8; 32], pub_b: &[u8; 32]) -> [u8; 16] {
+    let (first, second) = if pub_a <= pub_b {
+        (pub_a, pub_b)
+    } else {
+        (pub_b, pub_a)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"t3Bridge-P2P-Probe-v1:");
+    hasher.update(session_id.as_bytes());
+    hasher.update(first);
+    hasher.update(second);
+    let digest = hasher.finalize();
+    let mut token = [0u8; 16];
+    token.copy_from_slice(&digest[..16]);
+    token
+}
+
+/// Encodes an authenticated 27-byte P2P/Relay probe packet:
+/// `[0x54, 0x33][kind: 1B][token: 16B][timestamp_ms: 8B BE]`
+pub fn encode_p2p_probe(kind: P2pProbeKind, token: &[u8; 16], ts_ms: u64) -> [u8; P2P_PROBE_LEN] {
+    let mut out = [0u8; P2P_PROBE_LEN];
+    out[0..2].copy_from_slice(&P2P_PROBE_MAGIC);
+    out[2] = kind as u8;
+    out[3..19].copy_from_slice(token);
+    out[19..27].copy_from_slice(&ts_ms.to_be_bytes());
+    out
+}
+
+/// Decodes a 27-byte P2P/Relay probe packet. Returns `None` for WireGuard/STUN/garbage packets.
+pub fn decode_p2p_probe(buf: &[u8]) -> Option<(P2pProbeKind, [u8; 16], u64)> {
+    if buf.len() != P2P_PROBE_LEN || buf[0..2] != P2P_PROBE_MAGIC {
+        return None;
+    }
+    let kind = P2pProbeKind::from_byte(buf[2])?;
+    let mut token = [0u8; 16];
+    token.copy_from_slice(&buf[3..19]);
+    let ts_ms = u64::from_be_bytes([
+        buf[19], buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26],
+    ]);
+    Some((kind, token, ts_ms))
+}
 
 /// Local WireGuard X25519 keypair for a t3Bridge node.
 pub struct WireGuardKeypair {
@@ -67,9 +141,11 @@ pub struct DecapOutput {
 pub struct WgPeerSession {
     pub virtual_ip: Ipv4Addr,
     pub session_id: String,
+    pub probe_token: [u8; 16],
     pub tunn: Tunn,
     pub direct_endpoint: Option<SocketAddr>,
     pub candidates: Vec<SocketAddr>,
+    pub created_at: Instant,
     pub last_direct_rx: Option<Instant>,
     pub last_relay_rx: Option<Instant>,
 }
@@ -83,6 +159,10 @@ impl WgPeerSession {
         peer_index: u32,
         candidates: Vec<SocketAddr>,
     ) -> Self {
+        let local_public = PublicKey::from(&local_secret);
+        let probe_token =
+            derive_p2p_probe_token(&session_id, local_public.as_bytes(), remote_public.as_bytes());
+
         let tunn = Tunn::new(
             local_secret,
             remote_public,
@@ -95,12 +175,27 @@ impl WgPeerSession {
         Self {
             virtual_ip,
             session_id,
+            probe_token,
             tunn,
             direct_endpoint: candidates.first().copied(),
             candidates,
+            created_at: Instant::now(),
             last_direct_rx: None,
             last_relay_rx: None,
         }
+    }
+
+    /// Constant-time check whether a received probe token authenticates this peer.
+    pub fn matches_probe_token(&self, candidate: &[u8; 16]) -> bool {
+        let mut diff = 0u8;
+        for i in 0..16 {
+            diff |= self.probe_token[i] ^ candidate[i];
+        }
+        diff == 0
+    }
+
+    pub fn build_probe(&self, kind: P2pProbeKind, ts_ms: u64) -> [u8; P2P_PROBE_LEN] {
+        encode_p2p_probe(kind, &self.probe_token, ts_ms)
     }
 
     pub fn is_direct_udp_active(&self) -> bool {
@@ -277,5 +372,64 @@ mod tests {
         let client_rx = client.decapsulate_wg(None, &reply_enc);
         assert!(client_rx.authenticated);
         assert_eq!(client_rx.tunnel_ipv4.as_deref(), Some(ipv4_pkt.as_slice()));
+    }
+
+    #[test]
+    fn test_p2p_probe_token_symmetry_and_direct_udp_promotion() {
+        let host_keys = WireGuardKeypair::generate();
+        let client_keys = WireGuardKeypair::generate();
+        let host_pub = WireGuardKeypair::decode_public_key_b64(&host_keys.public_key_b64()).unwrap();
+        let client_pub = WireGuardKeypair::decode_public_key_b64(&client_keys.public_key_b64()).unwrap();
+
+        let mut host = WgPeerSession::new(
+            Ipv4Addr::new(10, 99, 0, 2),
+            "sess_tok_abcdef01".into(),
+            host_keys.secret_clone(),
+            client_pub,
+            1,
+            vec![],
+        );
+        let mut client = WgPeerSession::new(
+            Ipv4Addr::new(10, 99, 0, 1),
+            "sess_tok_abcdef01".into(),
+            client_keys.secret_clone(),
+            host_pub,
+            2,
+            vec![],
+        );
+
+        // Both peers must derive the exact same 16-byte authentication token
+        assert_eq!(host.probe_token, client.probe_token);
+        assert_eq!(host.active_transport_mode(), TransportMode::WsBinaryRelay);
+        assert_eq!(client.active_transport_mode(), TransportMode::WsBinaryRelay);
+
+        // Client sends UDP P2P_PING (bypasses boringtun anti-replay counter completely)
+        let ping_pkt = client.build_probe(P2pProbeKind::UdpPing, 123456789);
+        let (kind, tok, ts) = decode_p2p_probe(&ping_pkt).expect("valid probe");
+        assert_eq!(kind, P2pProbeKind::UdpPing);
+        assert_eq!(ts, 123456789);
+        assert!(host.matches_probe_token(&tok));
+
+        // Host receives ping from Client's real NAT-mapped address -> promotes immediately!
+        let client_nat_addr: SocketAddr = "203.0.113.55:49152".parse().unwrap();
+        host.mark_direct_rx(client_nat_addr);
+        assert_eq!(host.active_transport_mode(), TransportMode::DirectUdpP2p);
+        assert_eq!(host.direct_endpoint, Some(client_nat_addr));
+
+        // Host replies with UDP P2P_PONG echoing timestamp
+        let pong_pkt = host.build_probe(P2pProbeKind::UdpPong, ts);
+        let (p_kind, p_tok, p_ts) = decode_p2p_probe(&pong_pkt).expect("valid pong");
+        assert_eq!(p_kind, P2pProbeKind::UdpPong);
+        assert_eq!(p_ts, 123456789);
+        assert!(client.matches_probe_token(&p_tok));
+
+        let host_nat_addr: SocketAddr = "198.51.100.10:51820".parse().unwrap();
+        client.mark_direct_rx(host_nat_addr);
+        assert_eq!(client.active_transport_mode(), TransportMode::DirectUdpP2p);
+        assert_eq!(client.direct_endpoint, Some(host_nat_addr));
+
+        // WireGuard packets and random garbage must NOT decode as P2P probes
+        assert!(decode_p2p_probe(&[0x01, 0x00, 0x00, 0x00]).is_none());
+        assert!(decode_p2p_probe(&[0x04; 27]).is_none());
     }
 }
