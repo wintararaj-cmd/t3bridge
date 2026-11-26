@@ -130,6 +130,9 @@ pub enum IpcRequest {
         raw_key: String,
     },
     GetHostConfig,
+    SetHostCode {
+        host_code: String,
+    },
     SetHostPassword {
         password: String,
     },

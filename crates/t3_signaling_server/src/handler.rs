@@ -10,6 +10,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 const RELAY_TCP_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 const RELAY_SEND_BATCH_MAX: usize = 64;
+/// Bounded per-connection binary relay queue (tail-drops on severe congestion to stop bufferbloat & OOM)
+const RELAY_BINARY_CHANNEL_CAPACITY: usize = 512;
 
 pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry: Arc<PeerRegistry>) {
     // Low-latency socket tuning: disable Nagle's algorithm & enlarge buffers for SMB/DBF relay bursts
@@ -43,7 +45,7 @@ pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry
     println!("[+] WebSocket connection established: {}", addr);
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<SignalingMessage>();
-    let (bin_tx, mut bin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (bin_tx, mut bin_rx) = mpsc::channel::<Vec<u8>>(RELAY_BINARY_CHANNEL_CAPACITY);
 
     // Spawn outbound message pump (handles both JSON signaling & batch-flushed zero-overhead Binary relay frames)
     let pump_handle = tokio::spawn(async move {
@@ -92,6 +94,8 @@ pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry
     });
 
     let mut registered_peer_id: Option<String> = None;
+    // Task-local fast-path cache for the active binary relay route: eliminates RwLock + HashMap + String alloc per packet!
+    let mut cached_bin_route: Option<(String, mpsc::Sender<Vec<u8>>)> = None;
 
     while let Some(result) = ws_receiver.next().await {
         match result {
@@ -191,6 +195,13 @@ pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry
                             let _ = registry.forward_relay_data(&session_id, &tx, chunk).await;
                         }
                         SignalingMessage::RelayClose { session_id } => {
+                            if cached_bin_route
+                                .as_ref()
+                                .map(|(sid, _)| sid == &session_id)
+                                .unwrap_or(false)
+                            {
+                                cached_bin_route = None;
+                            }
                             registry.close_relay_session(&session_id, &tx).await;
                         }
                         SignalingMessage::Ping { peer_id: _ } => {
@@ -203,10 +214,27 @@ pub async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr, registry
                 }
             }
             Ok(Message::Binary(frame)) => {
-                // Fast-path: zero-JSON, zero-Base64 encrypted relay frame forwarding
+                // Fast-path: zero-JSON, zero-Base64, zero-lock encrypted relay frame forwarding
                 if let Some((session_id, _)) = t3_domain::decode_binary_relay_frame(&frame) {
-                    let sid = session_id.to_string();
-                    let _ = registry.forward_binary_relay(&sid, &bin_tx, frame).await;
+                    let hit_cache = matches!(
+                        &cached_bin_route,
+                        Some((cached_sid, target_tx)) if cached_sid == session_id && !target_tx.is_closed()
+                    );
+                    if hit_cache {
+                        if let Some((_, ref target_tx)) = cached_bin_route {
+                            let _ = target_tx.try_send(frame);
+                        }
+                    } else {
+                        let sid_owned = session_id.to_string();
+                        if let Some(target_tx) =
+                            registry.lookup_binary_relay_target(&sid_owned, &bin_tx).await
+                        {
+                            let _ = target_tx.try_send(frame);
+                            cached_bin_route = Some((sid_owned, target_tx));
+                        } else {
+                            cached_bin_route = None;
+                        }
+                    }
                 }
             }
             Ok(Message::Close(_)) => break,

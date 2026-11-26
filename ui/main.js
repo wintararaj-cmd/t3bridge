@@ -722,15 +722,51 @@ setInterval(async () => {
 // 7. Host / Office Server Mode Handler
 const toggleHostMode = document.getElementById('toggleHostMode');
 const hostConnectCodeInput = document.getElementById('hostConnectCodeInput');
+const btnSaveHostCode = document.getElementById('btnSaveHostCode');
 const hostStatusBadge = document.getElementById('hostStatusBadge');
 const btnCopyHostCode = document.getElementById('btnCopyHostCode');
 const hostActiveSharesContainer = document.getElementById('hostActiveSharesContainer');
 
 if (btnCopyHostCode && hostConnectCodeInput) {
   btnCopyHostCode.addEventListener('click', () => {
-    navigator.clipboard.writeText(hostConnectCodeInput.value.trim());
+    navigator.clipboard.writeText(hostConnectCodeInput.value.trim().toUpperCase());
     btnCopyHostCode.textContent = "Copied!";
     setTimeout(() => { btnCopyHostCode.textContent = "Copy Code"; }, 2000);
+  });
+}
+
+async function saveCustomHostCode() {
+  if (!hostConnectCodeInput || !btnSaveHostCode) return;
+  const raw = hostConnectCodeInput.value.trim();
+  if (raw.length < 3) {
+    alert("Connect Code must be at least 3 characters (e.g. OFFICE-SERVER).");
+    hostConnectCodeInput.focus();
+    return;
+  }
+  try {
+    btnSaveHostCode.disabled = true;
+    btnSaveHostCode.textContent = "Saving...";
+    const res = await invoke('set_host_code', { hostCode: raw });
+    if (res && res.host_code) {
+      hostConnectCodeInput.value = res.host_code;
+      btnSaveHostCode.textContent = "Saved!";
+      setTimeout(() => { btnSaveHostCode.textContent = "Save Code"; }, 1800);
+    }
+  } catch (err) {
+    alert("Failed to save Connect Code: " + err);
+    btnSaveHostCode.textContent = "Save Code";
+  } finally {
+    btnSaveHostCode.disabled = false;
+  }
+}
+
+if (btnSaveHostCode && hostConnectCodeInput) {
+  btnSaveHostCode.addEventListener('click', saveCustomHostCode);
+  hostConnectCodeInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      saveCustomHostCode();
+    }
   });
 }
 
@@ -803,7 +839,7 @@ if (toggleHostMode) {
           shareFolderPath: null,
           shareName: null,
         });
-        if (hostConnectCodeInput && res.host_code) {
+        if (hostConnectCodeInput && res.host_code && document.activeElement !== hostConnectCodeInput) {
           hostConnectCodeInput.value = res.host_code;
         }
         hostStatusBadge.textContent = "● Broadcasting on Cloud Mesh (" + res.host_code + ")";
@@ -1029,7 +1065,7 @@ async function loadHostConfig() {
   try {
     const config = await invoke('get_host_config');
     if (config) {
-      if (hostConnectCodeInput && config.host_code) {
+      if (hostConnectCodeInput && config.host_code && document.activeElement !== hostConnectCodeInput) {
         hostConnectCodeInput.value = config.host_code;
       }
       isHostPasswordConfigured = !!config.has_password;

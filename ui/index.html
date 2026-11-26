@@ -377,9 +377,10 @@
           <div class="share-info-box">
             <div class="info-item">
               <span class="info-label">Your Connect Code:</span>
-              <div style="display: flex; gap: 8px; align-items: center;">
-                <input type="text" id="hostConnectCodeInput" class="input-control" value="Generating..." readonly style="width: 220px; font-weight: 700; text-transform: uppercase; background: #0f172a; border-color: #334155; cursor: default;" />
-                <button type="button" id="btnCopyHostCode" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;">Copy Code</button>
+              <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <input type="text" id="hostConnectCodeInput" class="input-control" value="Generating..." maxlength="32" placeholder="e.g. OFFICE-SERVER" style="width: 220px; font-weight: 700; text-transform: uppercase; background: #0f172a; border-color: #334155;" />
+                <button type="button" id="btnSaveHostCode" class="btn btn-primary" style="padding: 6px 12px; font-size: 12px; white-space: nowrap;">Save Code</button>
+                <button type="button" id="btnCopyHostCode" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px; white-space: nowrap;">Copy Code</button>
               </div>
             </div>
             <div class="info-item">

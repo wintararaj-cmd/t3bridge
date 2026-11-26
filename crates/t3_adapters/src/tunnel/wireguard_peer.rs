@@ -151,6 +151,16 @@ pub struct DecapOutput {
     pub authenticated: bool,
 }
 
+/// Zero-allocation outcome of decapsulating an incoming WireGuard packet into a caller-provided buffer.
+pub struct DecapInPlaceResult {
+    /// Byte length of decrypted IPv4 packet written into `dst[..len]` (no heap allocation!).
+    pub tunnel_ipv4_len: Option<usize>,
+    /// Handshake/control WireGuard packets to send back to the peer (rare control path).
+    pub network_replies: Vec<Vec<u8>>,
+    /// True if `boringtun` authenticated this packet as valid for this peer.
+    pub authenticated: bool,
+}
+
 /// Per-peer WireGuard encryption state + dual-path transport state (Direct UDP P2P + Binary WS Fallback).
 pub struct WgPeerSession {
     pub virtual_ip: Ipv4Addr,
@@ -300,16 +310,16 @@ impl WgPeerSession {
         }
     }
 
-    /// Decapsulates an incoming WireGuard packet reusing caller-provided scratch buffer `dst`
-    /// to avoid per-packet heap allocations on the receive hot path.
-    pub fn decapsulate_wg_with_buf(
+    /// True zero-allocation hot-path decapsulation into caller-provided `dst` buffer.
+    /// On success with an IPv4 payload, writes decrypted bytes into `dst[..len]` and returns `tunnel_ipv4_len = Some(len)`.
+    pub fn decapsulate_wg_in_place(
         &mut self,
         src_ip: Option<IpAddr>,
         wg_pkt: &[u8],
         dst: &mut Vec<u8>,
-    ) -> DecapOutput {
-        let mut out = DecapOutput {
-            tunnel_ipv4: None,
+    ) -> DecapInPlaceResult {
+        let mut out = DecapInPlaceResult {
+            tunnel_ipv4_len: None,
             network_replies: Vec::new(),
             authenticated: false,
         };
@@ -326,7 +336,7 @@ impl WgPeerSession {
             }
             TunnResult::WriteToTunnelV4(slice, _) => {
                 out.authenticated = true;
-                out.tunnel_ipv4 = Some(slice.to_vec());
+                out.tunnel_ipv4_len = Some(slice.len());
             }
             TunnResult::WriteToNetwork(slice) => {
                 out.authenticated = true;
@@ -353,6 +363,21 @@ impl WgPeerSession {
         }
 
         out
+    }
+
+    /// Decapsulates an incoming WireGuard packet reusing caller-provided scratch buffer `dst`.
+    pub fn decapsulate_wg_with_buf(
+        &mut self,
+        src_ip: Option<IpAddr>,
+        wg_pkt: &[u8],
+        dst: &mut Vec<u8>,
+    ) -> DecapOutput {
+        let res = self.decapsulate_wg_in_place(src_ip, wg_pkt, dst);
+        DecapOutput {
+            tunnel_ipv4: res.tunnel_ipv4_len.map(|len| dst[..len].to_vec()),
+            network_replies: res.network_replies,
+            authenticated: res.authenticated,
+        }
     }
 
     /// Decapsulates an incoming WireGuard packet (received from either UDP or Binary WS).

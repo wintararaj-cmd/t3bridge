@@ -7,7 +7,7 @@ use t3_domain::{Peer, PeerRole, SignalingMessage, VirtualIp};
 pub struct ConnectedPeer {
     pub peer: Peer,
     pub tx: mpsc::UnboundedSender<SignalingMessage>,
-    pub binary_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    pub binary_tx: Option<mpsc::Sender<Vec<u8>>>,
     pub remote_addr: SocketAddr,
 }
 
@@ -15,8 +15,8 @@ pub struct ConnectedPeer {
 pub struct RelayPair {
     pub client_tx: mpsc::UnboundedSender<SignalingMessage>,
     pub host_tx: mpsc::UnboundedSender<SignalingMessage>,
-    pub client_bin_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
-    pub host_bin_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    pub client_bin_tx: Option<mpsc::Sender<Vec<u8>>>,
+    pub host_bin_tx: Option<mpsc::Sender<Vec<u8>>>,
     pub client_id: String,
     pub host_id: String,
 }
@@ -103,7 +103,7 @@ impl PeerRegistry {
         Ok(vip)
     }
 
-    pub async fn attach_binary_tx(&self, peer_id: &str, binary_tx: mpsc::UnboundedSender<Vec<u8>>) {
+    pub async fn attach_binary_tx(&self, peer_id: &str, binary_tx: mpsc::Sender<Vec<u8>>) {
         let mut map = self.peers.write().await;
         if let Some(cp) = map.get_mut(peer_id) {
             cp.binary_tx = Some(binary_tx);
@@ -180,27 +180,38 @@ impl PeerRegistry {
         );
     }
 
+    /// Resolves the destination bounded binary channel for a relay session so callers can cache it
+    /// locally and bypass global `RwLock` + `HashMap` lookups on every subsequent binary frame.
+    pub async fn lookup_binary_relay_target(
+        &self,
+        session_id: &str,
+        sender_bin_tx: &mpsc::Sender<Vec<u8>>,
+    ) -> Option<mpsc::Sender<Vec<u8>>> {
+        let sessions = self.relay_sessions.read().await;
+        let pair = sessions.get(session_id)?;
+        let is_from_client = pair
+            .client_bin_tx
+            .as_ref()
+            .map(|tx| tx.same_channel(sender_bin_tx))
+            .unwrap_or(false);
+        if is_from_client {
+            pair.host_bin_tx.clone()
+        } else {
+            pair.client_bin_tx.clone()
+        }
+    }
+
     /// Zero-JSON, zero-Base64 binary WebSocket frame forwarding between paired peers.
+    /// Uses non-blocking `try_send` on bounded channels to prevent bufferbloat and OOM on slow links.
+    #[allow(dead_code)]
     pub async fn forward_binary_relay(
         &self,
         session_id: &str,
-        sender_bin_tx: &mpsc::UnboundedSender<Vec<u8>>,
+        sender_bin_tx: &mpsc::Sender<Vec<u8>>,
         raw_frame: Vec<u8>,
     ) -> bool {
-        let sessions = self.relay_sessions.read().await;
-        if let Some(pair) = sessions.get(session_id) {
-            let is_from_client = pair
-                .client_bin_tx
-                .as_ref()
-                .map(|tx| tx.same_channel(sender_bin_tx))
-                .unwrap_or(false);
-            if is_from_client {
-                if let Some(ref host_bin) = pair.host_bin_tx {
-                    return host_bin.send(raw_frame).is_ok();
-                }
-            } else if let Some(ref client_bin) = pair.client_bin_tx {
-                return client_bin.send(raw_frame).is_ok();
-            }
+        if let Some(target_tx) = self.lookup_binary_relay_target(session_id, sender_bin_tx).await {
+            return target_tx.try_send(raw_frame).is_ok();
         }
         false
     }
@@ -369,9 +380,9 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9003".parse().unwrap();
 
         let (host_tx, _host_rx) = mpsc::unbounded_channel();
-        let (host_bin_tx, mut host_bin_rx) = mpsc::unbounded_channel();
+        let (host_bin_tx, mut host_bin_rx) = mpsc::channel(64);
         let (client_tx, _client_rx) = mpsc::unbounded_channel();
-        let (client_bin_tx, mut client_bin_rx) = mpsc::unbounded_channel();
+        let (client_bin_tx, mut client_bin_rx) = mpsc::channel(64);
 
         registry
             .register("HOST-1".into(), PeerRole::HostServer, host_tx.clone(), addr)

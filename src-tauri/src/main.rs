@@ -71,6 +71,7 @@ fn main() {
             stop_host_mode,
             get_host_status,
             get_host_config,
+            set_host_code,
             set_host_password,
             get_saved_client_credentials,
             save_client_credentials,

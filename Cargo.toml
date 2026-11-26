@@ -43,3 +43,10 @@ base64 = "0.22"
 # Testing & Mocks (TDD)
 mockall = "0.13"
 tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

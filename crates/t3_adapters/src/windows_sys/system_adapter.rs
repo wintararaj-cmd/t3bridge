@@ -3,12 +3,18 @@ use t3_application::ports::WindowsSystemPort;
 use t3_domain::{DomainError, DomainResult};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+static SMB_CLIENT_TUNED: AtomicBool = AtomicBool::new(false);
+static SMB_SERVER_TUNED: AtomicBool = AtomicBool::new(false);
+static FIREWALL_UDP_RULES_APPLIED: AtomicBool = AtomicBool::new(false);
+static LINKED_CONNECTIONS_SET: AtomicBool = AtomicBool::new(false);
 
 const LANMAN_WORKSTATION_PARAMS_KEY: &str =
     r"HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters";
@@ -87,6 +93,23 @@ pub(crate) fn smb_client_wan_tuning_entries() -> &'static [RegistryDwordEntry] {
             key: LANMAN_WORKSTATION_PARAMS_KEY,
             value_name: "MaxCmds",
             data: 2048,
+        },
+        // Keep open Marg/Tally DBF handles alive across brief 4G/5G handoffs (prevents "Delayed Write Failed")
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "SessTimeout",
+            data: 120,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "ExtendedSessTimeout",
+            data: 1000,
+        },
+        // WireGuard already encrypts the tunnel with ChaCha20-Poly1305; avoid double signing overhead on Win11 24H2+
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "RequireSecuritySignature",
+            data: 0,
         },
     ]
 }
@@ -219,19 +242,51 @@ impl WindowsSystemAdapter {
     }
 
     /// Applies Windows SMB Client (`LanmanWorkstation`) WAN & DBF/ERP caching/Large-MTU tuning.
-    /// Safe and idempotent; requires Administrator / LocalSystem privileges for HKLM writes.
+    /// Runs once per process lifetime to avoid spawning 14 sequential `reg.exe` processes on every reconnect.
     pub fn apply_smb_client_wan_tuning() {
+        if SMB_CLIENT_TUNED.swap(true, Ordering::SeqCst) {
+            return;
+        }
         Self::apply_registry_dword_entries(smb_client_wan_tuning_entries());
     }
 
     /// Applies Windows SMB Server (`LanmanServer`) WAN & DBF/ERP throughput tuning on Host PCs.
+    /// Runs once per process lifetime.
     pub fn apply_smb_server_wan_tuning() {
+        if SMB_SERVER_TUNED.swap(true, Ordering::SeqCst) {
+            return;
+        }
         Self::apply_registry_dword_entries(smb_server_wan_tuning_entries());
+    }
+
+    /// Ensures `EnableLinkedConnections = 1` is set once per process lifetime so non-elevated Explorer
+    /// sees drives mapped by elevated t3Bridge.
+    pub fn ensure_linked_connections_enabled() {
+        if LINKED_CONNECTIONS_SET.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _ = Self::hidden_command("reg")
+            .args([
+                "add",
+                r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+                "/v",
+                "EnableLinkedConnections",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                "1",
+                "/f",
+            ])
+            .output();
     }
 
     /// Adds Windows Defender Firewall inbound & outbound UDP allow rules for `t3bridge-service.exe`
     /// and `t3bridge_ui.exe` (with `edgetraversal=yes`) so Direct WireGuard UDP P2P packets are never silently blocked.
+    /// Runs once per process lifetime to keep reconnects fast.
     pub fn allow_p2p_udp_firewall_rules() {
+        if FIREWALL_UDP_RULES_APPLIED.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let Ok(current_exe) = std::env::current_exe() else {
             return;
         };
@@ -342,42 +397,35 @@ impl Default for WindowsSystemAdapter {
     }
 }
 
+/// Extracts the host component from a UNC path like `\\10.99.0.1\MARGERP` -> `Some("10.99.0.1")`.
+fn extract_unc_host(unc_path: &str) -> Option<&str> {
+    let trimmed = unc_path.trim().strip_prefix(r"\\")?;
+    let host = trimmed.split('\\').next()?.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
 #[async_trait]
 impl WindowsSystemPort for WindowsSystemAdapter {
     async fn mount_drive(&self, letter: char, unc_path: &str) -> DomainResult<()> {
         let drive_spec = format!("{}:", letter.to_ascii_uppercase());
 
-        // First clean up any existing disconnected or ghost drive mapping:
-        let _ = Self::hidden_command("net")
-            .args(["use", &drive_spec, "/delete", "/y"])
-            .output();
+        // 1. Apply SMB Client WAN & DBF/ERP Registry Tuning + LinkedConnections (one-shot per process)
+        //    and clear any existing stale mapping on this drive letter in a blocking worker thread.
+        let drive_for_cleanup = drive_spec.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            Self::ensure_linked_connections_enabled();
+            Self::apply_smb_client_wan_tuning();
+            let _ = Self::hidden_command("net")
+                .args(["use", &drive_for_cleanup, "/delete", "/y"])
+                .output();
+        })
+        .await;
 
-        // Ensure EnableLinkedConnections = 1 is set in Registry
-        // (Allows Windows Explorer running under non-elevated user token to see drives mapped by elevated t3Bridge)
-        let _ = Self::hidden_command("reg")
-            .args([
-                "add",
-                r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
-                "/v",
-                "EnableLinkedConnections",
-                "/t",
-                "REG_DWORD",
-                "/d",
-                "1",
-                "/f",
-            ])
-            .output();
-
-        // 2. Apply SMB Client WAN & DBF/ERP Performance Registry Tuning
-        //    (Guest Auth, DisableBandwidthThrottling=1, DisableLargeMtu=0, metadata cache sizes & lifetimes, MaxCmds)
-        Self::apply_smb_client_wan_tuning();
-
-        // 3. Clear any existing mapping or stale connection on this drive letter
-        let _ = Self::hidden_command("net")
-            .args(["use", &drive_spec, "/delete", "/y"])
-            .output();
-
-        // 4. Run: net use Z: \\host\Share /persistent:no /y with a 18s timeout for WAN connections
+        // 2. Run: net use Z: \\host\Share /persistent:no /y with a 75s timeout for WAN connections
         let run_cmd = |args: Vec<String>| async move {
             let mut cmd = tokio::process::Command::new("net");
             #[cfg(windows)]
@@ -401,22 +449,68 @@ impl WindowsSystemPort for WindowsSystemAdapter {
         };
 
         if !success {
+            let mut guest_err_detail: Option<String> = None;
+
             // Only retry with Guest credentials if the first attempt returned an error
             // (not when it timed out — a second long wait would just double the delay).
             if matches!(output, Ok(Ok(_))) {
+                // Attempt 2: Proper empty password "" with /user:Guest
+                // (Note: Command::args quotes empty string automatically; passing literal `""` fails auth!)
                 let fallback_output = run_cmd(vec![
                     "use".into(),
                     drive_spec.clone(),
                     unc_path.to_string(),
-                    r#""""#.into(),
+                    String::new(),
                     "/user:Guest".into(),
                     "/persistent:no".into(),
                     "/y".into(),
-                ]).await;
+                ])
+                .await;
 
                 if let Ok(Ok(fb)) = fallback_output {
                     if fb.status.success() {
                         return Ok(());
+                    }
+                    let fb_err = format!(
+                        "{} {}",
+                        String::from_utf8_lossy(&fb.stdout).trim(),
+                        String::from_utf8_lossy(&fb.stderr).trim()
+                    );
+                    if !fb_err.trim().is_empty() {
+                        guest_err_detail = Some(fb_err.trim().to_string());
+                    }
+                }
+
+                // Attempt 3: Clear any stale \\host\IPC$ ghost session (avoids System Error 1219)
+                // and try explicit `<host>\Guest` blank-password auth.
+                if let Some(host) = extract_unc_host(unc_path) {
+                    let ipc_unc = format!(r"\\{}\IPC$", host);
+                    let _ = run_cmd(vec!["use".into(), ipc_unc, "/delete".into(), "/y".into()]).await;
+
+                    let host_guest_user = format!(r"/user:{}\Guest", host);
+                    let fallback2 = run_cmd(vec![
+                        "use".into(),
+                        drive_spec.clone(),
+                        unc_path.to_string(),
+                        String::new(),
+                        host_guest_user,
+                        "/persistent:no".into(),
+                        "/y".into(),
+                    ])
+                    .await;
+
+                    if let Ok(Ok(fb2)) = fallback2 {
+                        if fb2.status.success() {
+                            return Ok(());
+                        }
+                        let fb2_err = format!(
+                            "{} {}",
+                            String::from_utf8_lossy(&fb2.stdout).trim(),
+                            String::from_utf8_lossy(&fb2.stderr).trim()
+                        );
+                        if !fb2_err.trim().is_empty() {
+                            guest_err_detail = Some(fb2_err.trim().to_string());
+                        }
                     }
                 }
             }
@@ -424,7 +518,22 @@ impl WindowsSystemPort for WindowsSystemAdapter {
             let err_msg = if let Ok(Ok(out)) = output {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                format!("{} {}", stdout.trim(), stderr.trim())
+                let mut raw = format!("{} {}", stdout.trim(), stderr.trim());
+                if let Some(g_err) = guest_err_detail {
+                    raw = format!("{} (Guest retry: {})", raw.trim(), g_err);
+                }
+                if raw.contains("1223")
+                    || raw.contains("1326")
+                    || raw.contains("Enter the user name")
+                    || raw.contains("Access is denied")
+                {
+                    format!(
+                        "{}\n\nFix on Host PC: Ensure Password Protected Sharing is OFF AND the shared folder's Sharing + NTFS Security tabs both include 'Everyone' (Full Control).",
+                        raw.trim()
+                    )
+                } else {
+                    raw
+                }
             } else {
                 "Connection timed out waiting for the SMB handshake over the relay.".to_string()
             };
@@ -547,12 +656,16 @@ impl WindowsSystemPort for WindowsSystemAdapter {
     }
 
     async fn list_remote_shares(&self, host: &str) -> DomainResult<Vec<String>> {
-        // Run: net view \\<host> and parse share names from output
+        // Run `net view \\<host>` off the Tokio async worker thread to avoid blocking packet loops
         let unc_host = format!(r"\\{}", host);
-        let output = Self::hidden_command("net")
-            .args(["view", &unc_host])
-            .output()
-            .map_err(|e| DomainError::InvalidIpAddress(format!("Failed to run 'net view': {}", e)))?;
+        let output = tokio::task::spawn_blocking(move || {
+            Self::hidden_command("net")
+                .args(["view", &unc_host])
+                .output()
+        })
+        .await
+        .map_err(|e| DomainError::InvalidIpAddress(format!("Failed to join 'net view': {}", e)))?
+        .map_err(|e| DomainError::InvalidIpAddress(format!("Failed to run 'net view': {}", e)))?;
 
         let raw = String::from_utf8_lossy(&output.stdout).to_string();
         let shares = parse_net_view_output(&raw);
@@ -560,11 +673,13 @@ impl WindowsSystemPort for WindowsSystemAdapter {
     }
 
     async fn list_local_shares(&self) -> DomainResult<Vec<String>> {
-        // Run: net share and parse local share names from output
-        let output = Self::hidden_command("net")
-            .args(["share"])
-            .output()
-            .map_err(|e| DomainError::InvalidIpAddress(format!("Failed to run 'net share': {}", e)))?;
+        // Run `net share` off the Tokio async worker thread to avoid blocking packet loops
+        let output = tokio::task::spawn_blocking(move || {
+            Self::hidden_command("net").args(["share"]).output()
+        })
+        .await
+        .map_err(|e| DomainError::InvalidIpAddress(format!("Failed to join 'net share': {}", e)))?
+        .map_err(|e| DomainError::InvalidIpAddress(format!("Failed to run 'net share': {}", e)))?;
 
         let raw = String::from_utf8_lossy(&output.stdout).to_string();
         let shares = parse_net_share_output(&raw);
@@ -626,6 +741,9 @@ The command completed successfully.
         assert_eq!(find("DirectoryCacheEntriesMax"), Some(128));
         assert_eq!(find("FileNotFoundCacheEntriesMax"), Some(512));
         assert_eq!(find("MaxCmds"), Some(2048));
+        assert_eq!(find("SessTimeout"), Some(120));
+        assert_eq!(find("ExtendedSessTimeout"), Some(1000));
+        assert_eq!(find("RequireSecuritySignature"), Some(0));
         assert!(entries
             .iter()
             .all(|e| e.key == LANMAN_WORKSTATION_PARAMS_KEY));
@@ -649,5 +767,12 @@ The command completed successfully.
         let paths = collect_firewall_udp_program_paths(&cur);
         assert!(!paths.is_empty());
         assert_eq!(paths[0], cur);
+    }
+
+    #[test]
+    fn test_extract_unc_host() {
+        assert_eq!(extract_unc_host(r"\\10.99.0.1\MARGERP"), Some("10.99.0.1"));
+        assert_eq!(extract_unc_host(r"\\SERVER-PC\SharedData"), Some("SERVER-PC"));
+        assert_eq!(extract_unc_host("C:\\local"), None);
     }
 }

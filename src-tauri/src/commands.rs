@@ -15,7 +15,8 @@ use t3_domain::{
     SignalingMessage, TransportMode, TunnelMetrics, VirtualIp,
 };
 use t3_ipc::{
-    get_shared_data_dir, get_shared_license_path, load_service_config, protect_secret,
+    get_shared_data_dir, get_shared_license_path, is_legacy_desktop_host_code, load_service_config,
+    protect_secret, resolve_default_node_label, sanitize_custom_host_code, sanitize_node_segment,
     save_service_config, send_ipc_request, unprotect_secret, BenchmarkReport, IpcRequest,
     IpcResponse, ServiceSnapshot,
 };
@@ -45,8 +46,25 @@ pub struct AppState {
     pub host_share_name: Mutex<String>,
     pub host_share_path: Mutex<String>,
     pub discovered_shares: Arc<Mutex<Vec<String>>>,
+    pub cached_local_shares: Arc<Mutex<(Vec<String>, Option<std::time::Instant>)>>,
     pub host_connected_clients: Arc<Mutex<std::collections::HashSet<String>>>,
     pub host_max_nodes: Arc<Mutex<u32>>,
+}
+
+async fn get_cached_local_shares(state: &AppState, force_refresh: bool) -> Vec<String> {
+    const LOCAL_SHARES_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    if !force_refresh {
+        let guard = state.cached_local_shares.lock().await;
+        if let Some(updated_at) = guard.1 {
+            if updated_at.elapsed() < LOCAL_SHARES_TTL {
+                return guard.0.clone();
+            }
+        }
+    }
+    let fresh = state.system.list_local_shares().await.unwrap_or_default();
+    let mut guard = state.cached_local_shares.lock().await;
+    *guard = (fresh.clone(), Some(std::time::Instant::now()));
+    fresh
 }
 
 #[derive(Serialize, Deserialize)]
@@ -172,48 +190,31 @@ pub fn hash_password_with_salt(password: &str, salt: &str) -> String {
 }
 
 pub async fn compute_host_code(state: &AppState) -> String {
+    // 1. Honor any user-customized Connect Code saved in service_config.json or local host_config.json
+    if let Ok(svc_cfg) = load_service_config() {
+        if svc_cfg.host.custom_host_code && !svc_cfg.host.host_code.trim().is_empty() {
+            return svc_cfg.host.host_code;
+        }
+    }
+
     let license_check = CheckLicenseStatusUseCase::new(
         Arc::clone(&state.hwid_provider),
         Arc::clone(&state.storage),
     );
     let license_status = license_check.execute().await;
 
-    let raw_user = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "SERVER".into());
-    let mut clean_user: String = raw_user
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect::<String>()
-        .to_ascii_uppercase();
-    if clean_user.is_empty() {
-        clean_user = "SERVER".to_string();
-    }
-    if clean_user.len() > 10 {
-        clean_user.truncate(10);
-    }
+    // Prefer real Windows USERNAME (e.g. TRISHITA), falling back to full COMPUTERNAME (up to 15 chars)
+    let clean_user = resolve_default_node_label();
 
     match license_status {
         Ok(LicenseStatus::Licensed { customer_name, .. }) => {
-            let mut clean_company: String = customer_name
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-                .collect::<String>()
-                .to_ascii_uppercase();
-            while clean_company.contains("__") {
-                clean_company = clean_company.replace("__", "_");
-            }
-            clean_company = clean_company.trim_matches('_').to_string();
-            if clean_company.is_empty() {
-                clean_company = "LICENSED".to_string();
-            }
-            if clean_company.len() > 16 {
-                clean_company.truncate(16);
-            }
+            let clean_company = sanitize_node_segment(&customer_name, 16, "LICENSED");
             let licensed_code = format!("{}-{}", clean_company, clean_user);
             if let Ok(mut svc_cfg) = load_service_config() {
-                if svc_cfg.host.host_code.trim().is_empty()
-                    || svc_cfg.host.host_code.starts_with("TRIAL-")
+                if !svc_cfg.host.custom_host_code
+                    && (svc_cfg.host.host_code.trim().is_empty()
+                        || svc_cfg.host.host_code.starts_with("TRIAL-")
+                        || is_legacy_desktop_host_code(&svc_cfg.host.host_code))
                 {
                     svc_cfg.host.host_code = licensed_code.clone();
                     let _ = save_service_config(&svc_cfg);
@@ -222,9 +223,10 @@ pub async fn compute_host_code(state: &AppState) -> String {
             licensed_code
         }
         _ => {
-            // Reuse persisted host_code from shared service_config.json if available so UI and Service always match!
             if let Ok(svc_cfg) = load_service_config() {
-                if !svc_cfg.host.host_code.trim().is_empty() {
+                if !svc_cfg.host.host_code.trim().is_empty()
+                    && !is_legacy_desktop_host_code(&svc_cfg.host.host_code)
+                {
                     return svc_cfg.host.host_code;
                 }
             }
@@ -244,7 +246,17 @@ pub async fn compute_host_code(state: &AppState) -> String {
             } else {
                 "T301"
             };
-            format!("TRIAL-{}-{}", clean_user, suffix.to_ascii_uppercase())
+            let trial_code = format!("TRIAL-{}-{}", clean_user, suffix.to_ascii_uppercase());
+            if let Ok(mut svc_cfg) = load_service_config() {
+                if !svc_cfg.host.custom_host_code
+                    && (svc_cfg.host.host_code.trim().is_empty()
+                        || is_legacy_desktop_host_code(&svc_cfg.host.host_code))
+                {
+                    svc_cfg.host.host_code = trial_code.clone();
+                    let _ = save_service_config(&svc_cfg);
+                }
+            }
+            trial_code
         }
     }
 }
@@ -252,10 +264,26 @@ pub async fn compute_host_code(state: &AppState) -> String {
 #[tauri::command]
 pub async fn get_host_config(state: tauri::State<'_, AppState>) -> Result<UiHostConfig, String> {
     if let Ok(IpcResponse::HostConfig {
-        host_code,
+        mut host_code,
         has_password,
     }) = send_ipc_request(&IpcRequest::GetHostConfig).await
     {
+        // If Session 0 service generated an old/SYSTEM `DESKTOP-*` code and user hasn't set a custom code,
+        // upgrade once from Session 1 (where real Windows USERNAME like TRISHITA is available).
+        let is_custom = load_service_config()
+            .ok()
+            .map(|c| c.host.custom_host_code)
+            .unwrap_or(false);
+        if !is_custom && is_legacy_desktop_host_code(&host_code) {
+            let better = compute_host_code(&state).await;
+            if !better.is_empty() && better != host_code && !is_legacy_desktop_host_code(&better) {
+                if let Ok(mut svc_cfg) = load_service_config() {
+                    svc_cfg.host.host_code = better.clone();
+                    let _ = save_service_config(&svc_cfg);
+                }
+                host_code = better;
+            }
+        }
         *state.host_code.lock().await = host_code.clone();
         return Ok(UiHostConfig {
             host_code,
@@ -271,6 +299,66 @@ pub async fn get_host_config(state: tauri::State<'_, AppState>) -> Result<UiHost
 
     Ok(UiHostConfig {
         host_code: code,
+        has_password,
+    })
+}
+
+#[tauri::command]
+pub async fn set_host_code(
+    host_code: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<UiHostConfig, String> {
+    let clean_code = sanitize_custom_host_code(&host_code)?;
+
+    if let Ok(resp) = send_ipc_request(&IpcRequest::SetHostCode {
+        host_code: clean_code.clone(),
+    })
+    .await
+    {
+        match resp {
+            IpcResponse::HostConfig {
+                host_code,
+                has_password,
+            } => {
+                *state.host_code.lock().await = host_code.clone();
+                if let Ok(Some(mut local_cfg)) = load_host_config() {
+                    local_cfg.host_code = host_code.clone();
+                    local_cfg.updated_at = chrono::Utc::now().timestamp();
+                    let _ = save_host_config(&local_cfg);
+                }
+                return Ok(UiHostConfig {
+                    host_code,
+                    has_password,
+                });
+            }
+            IpcResponse::Error { message } => return Err(message),
+            _ => {}
+        }
+    }
+
+    // Fallback when service is not running: persist directly to shared service_config.json + local host_config.json
+    if let Ok(mut svc_cfg) = load_service_config() {
+        svc_cfg.host.host_code = clean_code.clone();
+        svc_cfg.host.custom_host_code = true;
+        svc_cfg.host.updated_at = chrono::Utc::now().timestamp();
+        let _ = save_service_config(&svc_cfg);
+    }
+
+    let has_password = if let Ok(Some(mut local_cfg)) = load_host_config() {
+        local_cfg.host_code = clean_code.clone();
+        local_cfg.updated_at = chrono::Utc::now().timestamp();
+        let _ = save_host_config(&local_cfg);
+        !local_cfg.password_hash.is_empty()
+    } else {
+        load_service_config()
+            .ok()
+            .map(|c| !c.host.password_hash.is_empty())
+            .unwrap_or(false)
+    };
+
+    *state.host_code.lock().await = clean_code.clone();
+    Ok(UiHostConfig {
+        host_code: clean_code,
         has_password,
     })
 }
@@ -928,8 +1016,9 @@ pub async fn connect_peer_only(
             if let Some(mut bin_rx) = client.take_binary_receiver().await {
                 let tunnel_for_bin = Arc::clone(&state.tunnel);
                 tokio::spawn(async move {
+                    let mut decap_buf = vec![0u8; 4096];
                     while let Some(frame) = bin_rx.recv().await {
-                        tunnel_for_bin.handle_inbound_binary_relay(&frame);
+                        tunnel_for_bin.handle_inbound_binary_relay_with_buf(&frame, &mut decap_buf);
                     }
                 });
             }
@@ -1320,8 +1409,9 @@ pub async fn start_host_mode(
     if let Some(mut bin_rx) = client.take_binary_receiver().await {
         let tunnel_for_bin = Arc::clone(&state.tunnel);
         tokio::spawn(async move {
+            let mut decap_buf = vec![0u8; 4096];
             while let Some(frame) = bin_rx.recv().await {
-                tunnel_for_bin.handle_inbound_binary_relay(&frame);
+                tunnel_for_bin.handle_inbound_binary_relay_with_buf(&frame, &mut decap_buf);
             }
         });
     }
@@ -1557,7 +1647,7 @@ pub async fn start_host_mode(
         });
     }
 
-    let detected_shares = state.system.list_local_shares().await.unwrap_or_default();
+    let detected_shares = get_cached_local_shares(&state, true).await;
 
     *state.host_signaling.lock().await = Some(Arc::clone(&client));
     *state.is_hosting.lock().await = true;
@@ -1632,7 +1722,7 @@ pub async fn get_host_status(state: tauri::State<'_, AppState>) -> Result<UiHost
     let active_nodes = state.host_connected_clients.lock().await.len() as u32;
     let max_nodes = *state.host_max_nodes.lock().await;
     let detected_shares = if hosting {
-        state.system.list_local_shares().await.unwrap_or_default()
+        get_cached_local_shares(&state, false).await
     } else {
         Vec::new()
     };
@@ -1890,6 +1980,7 @@ pub fn init_app_state() -> AppState {
         host_share_name: Mutex::new("SharedData".into()),
         host_share_path: Mutex::new(r"C:\SharedData".into()),
         discovered_shares: Arc::new(Mutex::new(Vec::new())),
+        cached_local_shares: Arc::new(Mutex::new((Vec::new(), None))),
         host_connected_clients: Arc::new(Mutex::new(std::collections::HashSet::new())),
         host_max_nodes: Arc::new(Mutex::new(3)),
     }

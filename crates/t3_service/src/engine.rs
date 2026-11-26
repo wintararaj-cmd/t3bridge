@@ -20,9 +20,10 @@ use t3_domain::{
 };
 use t3_ipc::{
     generate_salt, get_shared_data_dir, get_shared_license_path, hash_password_with_salt,
-    load_service_config, protect_secret, save_service_config, unprotect_secret, BenchmarkReport,
-    ClientSnapshot, ConnectionPhase, HostSnapshot, IpcRequest, IpcResponse, LicenseSnapshot,
-    ServiceConfig, ServiceMode, ServiceSnapshot, DEFAULT_SIGNALING_URL,
+    is_legacy_desktop_host_code, load_service_config, protect_secret, resolve_default_node_label,
+    sanitize_custom_host_code, sanitize_node_segment, save_service_config, unprotect_secret,
+    BenchmarkReport, ClientSnapshot, ConnectionPhase, HostSnapshot, IpcRequest, IpcResponse,
+    LicenseSnapshot, ServiceConfig, ServiceMode, ServiceSnapshot, DEFAULT_SIGNALING_URL,
 };
 use tokio::sync::Mutex;
 
@@ -58,6 +59,7 @@ pub struct ServiceEngine {
     active_server_ip: Mutex<Option<String>>,
     active_is_wan: Mutex<bool>,
     discovered_shares: Arc<Mutex<Vec<String>>>,
+    cached_local_shares: Arc<Mutex<(Vec<String>, Option<std::time::Instant>)>>,
     active_client_password: Mutex<Option<String>>,
 }
 
@@ -95,8 +97,27 @@ impl ServiceEngine {
             active_server_ip: Mutex::new(None),
             active_is_wan: Mutex::new(false),
             discovered_shares: Arc::new(Mutex::new(Vec::new())),
+            cached_local_shares: Arc::new(Mutex::new((Vec::new(), None))),
             active_client_password: Mutex::new(None),
         })
+    }
+
+    /// Returns local Windows SMB shares using a 60-second in-memory cache so Tray/UI `GetStatus`
+    /// polling (every 2.5s) never spawns `net share` subprocesses continuously.
+    async fn get_cached_local_shares(&self, force_refresh: bool) -> Vec<String> {
+        const LOCAL_SHARES_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        if !force_refresh {
+            let guard = self.cached_local_shares.lock().await;
+            if let Some(updated_at) = guard.1 {
+                if updated_at.elapsed() < LOCAL_SHARES_TTL {
+                    return guard.0.clone();
+                }
+            }
+        }
+        let fresh = self.system.list_local_shares().await.unwrap_or_default();
+        let mut guard = self.cached_local_shares.lock().await;
+        *guard = (fresh.clone(), Some(std::time::Instant::now()));
+        fresh
     }
 
     async fn log_event(&self, msg: impl Into<String>) {
@@ -271,56 +292,43 @@ impl ServiceEngine {
     }
 
     pub async fn compute_host_code(&self) -> String {
+        // Honor any user-customized Connect Code permanently (never overwrite it)
+        {
+            let cfg = self.config.lock().await;
+            if cfg.host.custom_host_code && !cfg.host.host_code.trim().is_empty() {
+                return cfg.host.host_code.clone();
+            }
+        }
+
         let license_check = CheckLicenseStatusUseCase::new(
             Arc::clone(&self.hwid_provider),
             Arc::clone(&self.storage),
         );
         let license_status = license_check.execute().await;
 
-        let raw_name = std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("USERNAME"))
-            .unwrap_or_else(|_| "SERVER".into());
-        let mut clean_name: String = raw_name
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .collect::<String>()
-            .to_ascii_uppercase();
-        if clean_name.is_empty() {
-            clean_name = "SERVER".into();
-        }
-        if clean_name.len() > 10 {
-            clean_name.truncate(10);
-        }
+        // Prefer real Windows USERNAME (e.g. TRISHITA), falling back to full COMPUTERNAME (up to 15 chars)
+        let clean_name = resolve_default_node_label();
 
         match license_status {
             Ok(LicenseStatus::Licensed { customer_name, .. }) => {
-                let mut clean_company: String = customer_name
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect::<String>()
-                    .to_ascii_uppercase();
-                while clean_company.contains("__") {
-                    clean_company = clean_company.replace("__", "_");
+                // If UI already saved a clean non-DESKTOP licensed code, keep it so Session 0 & Session 1 match
+                {
+                    let cfg = self.config.lock().await;
+                    if !cfg.host.host_code.trim().is_empty()
+                        && !cfg.host.host_code.starts_with("TRIAL-")
+                        && !is_legacy_desktop_host_code(&cfg.host.host_code)
+                    {
+                        return cfg.host.host_code.clone();
+                    }
                 }
-                clean_company = clean_company.trim_matches('_').to_string();
-                if clean_company.is_empty() {
-                    clean_company = "LICENSED".into();
-                }
-                if clean_company.len() > 16 {
-                    clean_company.truncate(16);
-                }
+                let clean_company = sanitize_node_segment(&customer_name, 16, "LICENSED");
                 let licensed_code = format!("{}-{}", clean_company, clean_name);
-                // Replace any stale TRIAL-* code cached before license activation
                 {
                     let mut cfg = self.config.lock().await;
-                    if cfg.host.host_code.trim().is_empty()
-                        || cfg.host.host_code.starts_with("TRIAL-")
+                    if !cfg.host.custom_host_code
+                        && (cfg.host.host_code.trim().is_empty()
+                            || cfg.host.host_code.starts_with("TRIAL-")
+                            || is_legacy_desktop_host_code(&cfg.host.host_code))
                     {
                         cfg.host.host_code = licensed_code.clone();
                         let _ = save_service_config(&cfg);
@@ -332,7 +340,9 @@ impl ServiceEngine {
                 // Reuse persisted host_code if already generated so Session 0 (SYSTEM) and Session 1 (User) match!
                 {
                     let cfg = self.config.lock().await;
-                    if !cfg.host.host_code.trim().is_empty() {
+                    if !cfg.host.host_code.trim().is_empty()
+                        && !is_legacy_desktop_host_code(&cfg.host.host_code)
+                    {
                         return cfg.host.host_code.clone();
                     }
                 }
@@ -362,8 +372,11 @@ impl ServiceEngine {
             return Err("Please set a Host Access Password before starting Host Server Mode.".into());
         }
 
-        let code = if cfg.host.host_code.trim().is_empty()
+        let code = if cfg.host.custom_host_code && !cfg.host.host_code.trim().is_empty() {
+            cfg.host.host_code.clone()
+        } else if cfg.host.host_code.trim().is_empty()
             || cfg.host.host_code.starts_with("TRIAL-")
+            || is_legacy_desktop_host_code(&cfg.host.host_code)
         {
             self.compute_host_code().await
         } else {
@@ -465,8 +478,9 @@ impl ServiceEngine {
         if let Some(mut bin_rx) = client.take_binary_receiver().await {
             let tunnel_for_bin = Arc::clone(&self.tunnel);
             tokio::spawn(async move {
+                let mut decap_buf = vec![0u8; 4096];
                 while let Some(frame) = bin_rx.recv().await {
-                    tunnel_for_bin.handle_inbound_binary_relay(&frame);
+                    tunnel_for_bin.handle_inbound_binary_relay_with_buf(&frame, &mut decap_buf);
                 }
             });
         }
@@ -762,7 +776,7 @@ impl ServiceEngine {
             });
         }
 
-        let detected_shares = self.system.list_local_shares().await.unwrap_or_default();
+        let detected_shares = self.get_cached_local_shares(true).await;
         *self.host_signaling.lock().await = Some(client);
         *self.phase.lock().await = ConnectionPhase::Connected;
         *self.host_status_message.lock().await = "Broadcasting on Cloud P2P Mesh".into();
@@ -939,8 +953,10 @@ impl ServiceEngine {
                 if let Some(mut bin_rx) = client.take_binary_receiver().await {
                     let tunnel_for_bin = Arc::clone(&self.tunnel);
                     tokio::spawn(async move {
+                        let mut decap_buf = vec![0u8; 4096];
                         while let Some(frame) = bin_rx.recv().await {
-                            tunnel_for_bin.handle_inbound_binary_relay(&frame);
+                            tunnel_for_bin
+                                .handle_inbound_binary_relay_with_buf(&frame, &mut decap_buf);
                         }
                     });
                 }
@@ -1161,7 +1177,7 @@ impl ServiceEngine {
         };
 
         let detected_shares = if is_hosting {
-            self.system.list_local_shares().await.unwrap_or_default()
+            self.get_cached_local_shares(false).await
         } else {
             Vec::new()
         };
@@ -1373,13 +1389,45 @@ impl ServiceEngine {
             IpcRequest::GetHostConfig => {
                 let code = self.compute_host_code().await;
                 let mut cfg = self.config.lock().await;
-                if cfg.host.host_code.is_empty() || cfg.host.host_code != code {
+                if !cfg.host.custom_host_code
+                    && (cfg.host.host_code.is_empty() || cfg.host.host_code != code)
+                {
                     cfg.host.host_code = code.clone();
                     let _ = save_service_config(&cfg);
                 }
                 IpcResponse::HostConfig {
-                    host_code: code,
+                    host_code: cfg.host.host_code.clone(),
                     has_password: !cfg.host.password_hash.is_empty(),
+                }
+            }
+            IpcRequest::SetHostCode { host_code } => {
+                let clean_code = match sanitize_custom_host_code(&host_code) {
+                    Ok(c) => c,
+                    Err(e) => return IpcResponse::Error { message: e },
+                };
+                let (has_password, was_hosting) = {
+                    let mut cfg = self.config.lock().await;
+                    cfg.host.host_code = clean_code.clone();
+                    cfg.host.custom_host_code = true;
+                    cfg.host.updated_at = chrono::Utc::now().timestamp();
+                    if let Err(e) = save_service_config(&cfg) {
+                        return IpcResponse::Error { message: e };
+                    }
+                    let is_host_active = cfg.mode == ServiceMode::Host
+                        && matches!(
+                            *self.phase.lock().await,
+                            ConnectionPhase::Connected
+                                | ConnectionPhase::Connecting
+                                | ConnectionPhase::Reconnecting
+                        );
+                    (!cfg.host.password_hash.is_empty(), is_host_active)
+                };
+                if was_hosting {
+                    self.schedule_reconnect_loop("Host Connect Code updated");
+                }
+                IpcResponse::HostConfig {
+                    host_code: clean_code,
+                    has_password,
                 }
             }
             IpcRequest::SetHostPassword { password } => {

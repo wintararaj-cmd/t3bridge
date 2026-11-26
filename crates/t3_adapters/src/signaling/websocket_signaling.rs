@@ -12,6 +12,8 @@ use t3_domain::{DomainError, DomainResult, HolePunchPayload, Peer, SignalingMess
 const WS_TCP_SOCKET_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum number of queued WebSocket frames coalesced into a single TLS flush
 const WS_SEND_BATCH_MAX: usize = 64;
+/// Bounded queue capacity for outbound Binary WS relay frames (prevents bufferbloat on slow 4G/5G links)
+const WS_BINARY_CHANNEL_CAPACITY: usize = 512;
 
 fn tune_ws_tcp_socket(tcp: &tokio::net::TcpStream) {
     let _ = tcp.set_nodelay(true);
@@ -23,7 +25,7 @@ fn tune_ws_tcp_socket(tcp: &tokio::net::TcpStream) {
 pub struct WebSocketSignalingClient {
     tx: Arc<Mutex<Option<mpsc::UnboundedSender<SignalingMessage>>>>,
     inbound_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<SignalingMessage>>>>,
-    binary_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    binary_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
     binary_inbound_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>>,
 }
 
@@ -56,8 +58,8 @@ impl WebSocketSignalingClient {
         self.tx.lock().await.clone()
     }
 
-    /// Returns a zero-JSON sender for raw `Message::Binary` relay frames.
-    pub async fn get_binary_sender(&self) -> Option<mpsc::UnboundedSender<Vec<u8>>> {
+    /// Returns a zero-JSON bounded sender for raw `Message::Binary` relay frames.
+    pub async fn get_binary_sender(&self) -> Option<mpsc::Sender<Vec<u8>>> {
         self.binary_tx.lock().await.clone()
     }
 
@@ -100,7 +102,8 @@ impl SignalingPort for WebSocketSignalingClient {
 
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SignalingMessage>();
-        let (bin_outbound_tx, mut bin_outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (bin_outbound_tx, mut bin_outbound_rx) =
+            mpsc::channel::<Vec<u8>>(WS_BINARY_CHANNEL_CAPACITY);
         let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<Message>();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<SignalingMessage>();
         let (bin_inbound_tx, bin_inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -117,36 +120,74 @@ impl SignalingPort for WebSocketSignalingClient {
             }
         });
 
-        // Bridge raw binary relay outbound channel -> raw WebSocket Binary frames (zero JSON/Base64)
-        let raw_tx_for_bin = raw_tx.clone();
+        // Single-hop outbound WebSocket frame pump: reads bounded binary frames directly (zero extra task/hop)
+        // and coalesces bursts up to WS_SEND_BATCH_MAX into a single TLS flush for low latency.
         tokio::spawn(async move {
-            while let Some(frame) = bin_outbound_rx.recv().await {
-                if raw_tx_for_bin.send(Message::Binary(frame)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Outbound WebSocket frame pump (batch-feeds bursts then flushes once for low latency)
-        tokio::spawn(async move {
-            while let Some(first_frame) = raw_rx.recv().await {
-                if ws_sender.feed(first_frame).await.is_err() {
-                    break;
-                }
-                let mut batched = 1usize;
-                while batched < WS_SEND_BATCH_MAX {
-                    match raw_rx.try_recv() {
-                        Ok(next_frame) => {
-                            if ws_sender.feed(next_frame).await.is_err() {
-                                return;
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe_bin = bin_outbound_rx.recv() => {
+                        match maybe_bin {
+                            Some(first_bin) => {
+                                if ws_sender.feed(Message::Binary(first_bin)).await.is_err() {
+                                    break;
+                                }
+                                let mut batched = 1usize;
+                                while batched < WS_SEND_BATCH_MAX {
+                                    match bin_outbound_rx.try_recv() {
+                                        Ok(next_bin) => {
+                                            if ws_sender.feed(Message::Binary(next_bin)).await.is_err() {
+                                                return;
+                                            }
+                                            batched += 1;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                // Also drain any pending control/ping/pong frames into the same flush
+                                while batched < WS_SEND_BATCH_MAX {
+                                    match raw_rx.try_recv() {
+                                        Ok(ctrl) => {
+                                            if ws_sender.feed(ctrl).await.is_err() {
+                                                return;
+                                            }
+                                            batched += 1;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                if ws_sender.flush().await.is_err() {
+                                    break;
+                                }
                             }
-                            batched += 1;
+                            None => break,
                         }
-                        Err(_) => break,
                     }
-                }
-                if ws_sender.flush().await.is_err() {
-                    break;
+                    maybe_raw = raw_rx.recv() => {
+                        match maybe_raw {
+                            Some(first_frame) => {
+                                if ws_sender.feed(first_frame).await.is_err() {
+                                    break;
+                                }
+                                let mut batched = 1usize;
+                                while batched < WS_SEND_BATCH_MAX {
+                                    match raw_rx.try_recv() {
+                                        Ok(next_frame) => {
+                                            if ws_sender.feed(next_frame).await.is_err() {
+                                                return;
+                                            }
+                                            batched += 1;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                if ws_sender.flush().await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
                 }
             }
         });
