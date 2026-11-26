@@ -644,12 +644,44 @@ impl ServiceEngine {
                             pending_wg_peers.insert(
                                 token.clone(),
                                 (
-                                    parsed_offer.wg_pubkey,
-                                    parsed_offer.virtual_ip,
-                                    offer.public_endpoint,
-                                    offer.local_candidate,
+                                    parsed_offer.wg_pubkey.clone(),
+                                    parsed_offer.virtual_ip.clone(),
+                                    offer.public_endpoint.clone(),
+                                    offer.local_candidate.clone(),
                                 ),
                             );
+
+                            // Refresh STUN endpoint & immediately pre-register WireGuard peer + punch Host NAT
+                            // BEFORE HolePunchAnswer reaches Client (eliminates 700ms RelayRequest race condition!)
+                            let (fresh_public_ep, fresh_local_cand) =
+                                tunnel_for_host.refresh_p2p_endpoints().await;
+
+                            let can_accept =
+                                (host_clients_for_pump.lock().await.len() as u32) < allowed_nodes;
+                            if can_accept {
+                                if let (Some(client_wg_pub), Some(client_vip_str)) =
+                                    (&parsed_offer.wg_pubkey, &parsed_offer.virtual_ip)
+                                {
+                                    if let Ok(client_vip) =
+                                        client_vip_str.parse::<std::net::Ipv4Addr>()
+                                    {
+                                        let candidates = t3_adapters::parse_endpoint_candidates(
+                                            &offer.public_endpoint,
+                                            offer.local_candidate.as_deref(),
+                                        );
+                                        let pre_session_id = format!("sess_tok_{}", token);
+                                        let _ = tunnel_for_host
+                                            .register_wg_peer(
+                                                client_vip,
+                                                pre_session_id,
+                                                client_wg_pub,
+                                                candidates,
+                                                false,
+                                            )
+                                            .await;
+                                    }
+                                }
+                            }
 
                             let mut local_shares = system_for_host
                                 .list_local_shares()
@@ -661,8 +693,6 @@ impl ServiceEngine {
                                 local_shares.insert(0, share_for_pump.clone());
                             }
                             let shares_csv = local_shares.join(",");
-                            let (fresh_public_ep, fresh_local_cand) =
-                                tunnel_for_host.current_p2p_endpoints();
                             let answer = HolePunchPayload {
                                 peer_id: host_code_for_pump.clone(),
                                 public_endpoint: fresh_public_ep,

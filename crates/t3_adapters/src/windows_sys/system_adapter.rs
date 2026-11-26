@@ -230,7 +230,7 @@ impl WindowsSystemAdapter {
     }
 
     /// Adds Windows Defender Firewall inbound & outbound UDP allow rules for `t3bridge-service.exe`
-    /// and `t3bridge_ui.exe` so Direct WireGuard UDP P2P packets are never silently blocked.
+    /// and `t3bridge_ui.exe` (with `edgetraversal=yes`) so Direct WireGuard UDP P2P packets are never silently blocked.
     pub fn allow_p2p_udp_firewall_rules() {
         let Ok(current_exe) = std::env::current_exe() else {
             return;
@@ -256,6 +256,7 @@ impl WindowsSystemAdapter {
                     "protocol=UDP",
                     &prog_arg,
                     "profile=any",
+                    "edgetraversal=yes",
                 ])
                 .output();
 
@@ -277,6 +278,46 @@ impl WindowsSystemAdapter {
                 ])
                 .output();
         }
+    }
+
+    /// Explicitly opens the bound P2P UDP ports in Windows Defender Firewall with Edge Traversal enabled.
+    pub fn allow_p2p_udp_port_firewall_rules(ports: &[u16]) {
+        let valid_ports: Vec<String> = ports
+            .iter()
+            .copied()
+            .filter(|p| *p > 0)
+            .map(|p| p.to_string())
+            .collect();
+        if valid_ports.is_empty() {
+            return;
+        }
+        let ports_csv = valid_ports.join(",");
+        let port_arg = format!("localport={}", ports_csv);
+
+        let _ = Self::hidden_command("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                "name=t3Bridge-P2P-UDP-Ports",
+            ])
+            .output();
+        let _ = Self::hidden_command("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                "name=t3Bridge-P2P-UDP-Ports",
+                "dir=in",
+                "action=allow",
+                "protocol=UDP",
+                &port_arg,
+                "profile=any",
+                "edgetraversal=yes",
+            ])
+            .output();
     }
 }
 

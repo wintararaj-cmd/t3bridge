@@ -80,11 +80,11 @@ impl StunClientAdapter {
 
             if attr_type == ATTR_XOR_MAPPED_ADDRESS && attr_data.len() >= 8 {
                 let family = attr_data[1];
+                let xor_port = u16::from_be_bytes([attr_data[2], attr_data[3]]);
+                let port = xor_port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+
                 if family == 0x01 {
                     // IPv4
-                    let xor_port = u16::from_be_bytes([attr_data[2], attr_data[3]]);
-                    let port = xor_port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-
                     let xor_ip = u32::from_be_bytes([
                         attr_data[4],
                         attr_data[5],
@@ -95,11 +95,23 @@ impl StunClientAdapter {
                     let ip = std::net::Ipv4Addr::from(ip_num);
 
                     return Ok(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)));
+                } else if family == 0x02 && attr_data.len() >= 20 {
+                    // IPv6 (RFC 5389 Section 15.2: XOR first 4 bytes with magic cookie, next 12 bytes with tx_id)
+                    let cookie_bytes = STUN_MAGIC_COOKIE.to_be_bytes();
+                    let mut raw_v6 = [0u8; 16];
+                    for i in 0..4 {
+                        raw_v6[i] = attr_data[4 + i] ^ cookie_bytes[i];
+                    }
+                    for i in 0..12 {
+                        raw_v6[4 + i] = attr_data[8 + i] ^ expected_transaction_id[i];
+                    }
+                    let ip6 = std::net::Ipv6Addr::from(raw_v6);
+                    return Ok(SocketAddr::V6(std::net::SocketAddrV6::new(ip6, port, 0, 0)));
                 }
             } else if attr_type == ATTR_MAPPED_ADDRESS && attr_data.len() >= 8 {
                 let family = attr_data[1];
+                let port = u16::from_be_bytes([attr_data[2], attr_data[3]]);
                 if family == 0x01 {
-                    let port = u16::from_be_bytes([attr_data[2], attr_data[3]]);
                     let ip = std::net::Ipv4Addr::new(
                         attr_data[4],
                         attr_data[5],
@@ -107,6 +119,11 @@ impl StunClientAdapter {
                         attr_data[7],
                     );
                     return Ok(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)));
+                } else if family == 0x02 && attr_data.len() >= 20 {
+                    let mut raw_v6 = [0u8; 16];
+                    raw_v6.copy_from_slice(&attr_data[4..20]);
+                    let ip6 = std::net::Ipv6Addr::from(raw_v6);
+                    return Ok(SocketAddr::V6(std::net::SocketAddrV6::new(ip6, port, 0, 0)));
                 }
             }
         }
@@ -215,5 +232,41 @@ mod tests {
 
         let parsed = StunClientAdapter::parse_binding_response(&response, &tx_id).unwrap();
         assert_eq!(parsed.to_string(), "203.0.113.195:54321");
+    }
+
+    #[test]
+    fn test_stun_xor_mapped_ipv6_address_parser() {
+        let tx_id = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let mut response = Vec::new();
+
+        response.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
+        response.extend_from_slice(&24u16.to_be_bytes()); // Message Length: 24 bytes (4 attr hdr + 20 payload)
+        response.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        response.extend_from_slice(&tx_id);
+
+        response.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        response.extend_from_slice(&20u16.to_be_bytes());
+
+        let target_v6: std::net::Ipv6Addr = "2409:40e1:432:2c7a:dcf0:b718:b32b:dc88".parse().unwrap();
+        let raw_octets = target_v6.octets();
+        let raw_port = 49633u16;
+        let xor_port = raw_port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+
+        let cookie_bytes = STUN_MAGIC_COOKIE.to_be_bytes();
+        let mut xor_v6 = [0u8; 16];
+        for i in 0..4 {
+            xor_v6[i] = raw_octets[i] ^ cookie_bytes[i];
+        }
+        for i in 0..12 {
+            xor_v6[4 + i] = raw_octets[4 + i] ^ tx_id[i];
+        }
+
+        response.push(0x00);
+        response.push(0x02); // IPv6 family
+        response.extend_from_slice(&xor_port.to_be_bytes());
+        response.extend_from_slice(&xor_v6);
+
+        let parsed = StunClientAdapter::parse_binding_response(&response, &tx_id).unwrap();
+        assert_eq!(parsed, SocketAddr::V6(std::net::SocketAddrV6::new(target_v6, raw_port, 0, 0)));
     }
 }

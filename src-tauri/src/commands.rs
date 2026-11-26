@@ -1464,20 +1464,46 @@ pub async fn start_host_mode(
                         pending_wg_peers.insert(
                             token.clone(),
                             (
-                                parsed_offer.wg_pubkey,
-                                parsed_offer.virtual_ip,
-                                offer.public_endpoint,
-                                offer.local_candidate,
+                                parsed_offer.wg_pubkey.clone(),
+                                parsed_offer.virtual_ip.clone(),
+                                offer.public_endpoint.clone(),
+                                offer.local_candidate.clone(),
                             ),
                         );
+
+                        // Refresh STUN endpoint & pre-register WireGuard peer + punch Host NAT immediately
+                        let (fresh_public_ep, fresh_local_cand) =
+                            tunnel_for_host.refresh_p2p_endpoints().await;
+
+                        let can_accept = (host_clients.lock().await.len() as u32) < allowed_nodes;
+                        if can_accept {
+                            if let (Some(client_wg_pub), Some(client_vip_str)) =
+                                (&parsed_offer.wg_pubkey, &parsed_offer.virtual_ip)
+                            {
+                                if let Ok(client_vip) = client_vip_str.parse::<std::net::Ipv4Addr>() {
+                                    let candidates = t3_adapters::parse_endpoint_candidates(
+                                        &offer.public_endpoint,
+                                        offer.local_candidate.as_deref(),
+                                    );
+                                    let pre_session_id = format!("sess_tok_{}", token);
+                                    let _ = tunnel_for_host
+                                        .register_wg_peer(
+                                            client_vip,
+                                            pre_session_id,
+                                            client_wg_pub,
+                                            candidates,
+                                            false,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
 
                         let mut local_shares = system_for_host.list_local_shares().await.unwrap_or_default();
                         if !share_for_pump.is_empty() && !local_shares.contains(&share_for_pump) {
                             local_shares.insert(0, share_for_pump.clone());
                         }
                         let shares_csv = local_shares.join(",");
-                        let (fresh_public_ep, fresh_local_cand) =
-                            tunnel_for_host.current_p2p_endpoints();
                         let answer = t3_domain::HolePunchPayload {
                             peer_id: host_code_for_pump.clone(),
                             public_endpoint: fresh_public_ep,
