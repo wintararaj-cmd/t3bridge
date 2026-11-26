@@ -16,8 +16,8 @@ use t3_domain::{
 };
 use t3_ipc::{
     get_shared_data_dir, get_shared_license_path, load_service_config, protect_secret,
-    save_service_config, send_ipc_request, unprotect_secret, IpcRequest, IpcResponse,
-    ServiceSnapshot,
+    save_service_config, send_ipc_request, unprotect_secret, BenchmarkReport, IpcRequest,
+    IpcResponse, ServiceSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -1358,10 +1358,17 @@ pub async fn start_host_mode(
             });
 
             // One-time authorized session tokens & pending WireGuard peer offers
-            let mut authorized_tokens = std::collections::HashSet::<String>::new();
+            let mut authorized_tokens =
+                std::collections::HashMap::<String, std::time::Instant>::new();
             let mut pending_wg_peers = std::collections::HashMap::<
                 String,
-                (Option<String>, Option<String>, String, Option<String>),
+                (
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    Option<String>,
+                    std::time::Instant,
+                ),
             >::new();
             let mut vip_to_session = std::collections::HashMap::<String, String>::new();
 
@@ -1371,7 +1378,7 @@ pub async fn start_host_mode(
                     SignalingMessage::RelayRequest { target_peer_id: _, session_id } => {
                         let matched_token = session_id.strip_prefix("sess_tok_").map(|t| t.to_string());
                         let is_authenticated = if let Some(ref tok) = matched_token {
-                            authorized_tokens.remove(tok)
+                            authorized_tokens.remove(tok).is_some()
                         } else {
                             let incoming_pwd = session_id
                                 .split_once("::AUTH_")
@@ -1404,6 +1411,7 @@ pub async fn start_host_mode(
                                 Some(client_vip_str),
                                 client_pub_ep,
                                 client_local_ep,
+                                _,
                             )) = pending_wg_peers.remove(tok)
                             {
                                 if let Some(old_sid) =
@@ -1436,6 +1444,12 @@ pub async fn start_host_mode(
                         });
                     }
                     SignalingMessage::HolePunchOffer { target_peer_id: _, offer } => {
+                        authorized_tokens
+                            .retain(|_, created| created.elapsed() < std::time::Duration::from_secs(30));
+                        pending_wg_peers.retain(|_, (_, _, _, _, created)| {
+                            created.elapsed() < std::time::Duration::from_secs(30)
+                        });
+
                         let parsed_offer = t3_domain::parse_client_offer_meta(&offer.wireguard_pubkey);
 
                         let host_conf = load_host_config().ok().flatten().filter(|c| !c.password_hash.is_empty());
@@ -1463,7 +1477,8 @@ pub async fn start_host_mode(
                             .map(|_| format!("{:02x}", rand::random::<u8>()))
                             .collect();
                         let pre_session_id = format!("sess_tok_{}", token);
-                        authorized_tokens.insert(token.clone());
+                        let now_inst = std::time::Instant::now();
+                        authorized_tokens.insert(token.clone(), now_inst);
                         pending_wg_peers.insert(
                             token.clone(),
                             (
@@ -1471,6 +1486,7 @@ pub async fn start_host_mode(
                                 parsed_offer.virtual_ip.clone(),
                                 offer.public_endpoint.clone(),
                                 offer.local_candidate.clone(),
+                                now_inst,
                             ),
                         );
 
@@ -2066,6 +2082,70 @@ pub async fn trigger_service_reconnect() -> Result<String, String> {
         Err(e) => Err(e),
         _ => Ok("Reconnect requested".into()),
     }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UiBenchmarkResult {
+    pub transport_mode: String,
+    pub transport_mode_label: String,
+    pub min_rtt_ms: u32,
+    pub avg_rtt_ms: u32,
+    pub max_rtt_ms: u32,
+    pub jitter_ms: u32,
+    pub packet_loss_percent: u8,
+    pub throughput_mbps: f64,
+    pub throughput_mbytes_per_sec: f64,
+    pub packets_sent: u32,
+    pub packets_received: u32,
+    pub bytes_transferred: u64,
+    pub duration_ms: u64,
+}
+
+fn benchmark_report_to_ui(report: BenchmarkReport) -> UiBenchmarkResult {
+    let (transport_mode, transport_mode_label) = transport_mode_fields(report.transport_mode);
+    UiBenchmarkResult {
+        transport_mode,
+        transport_mode_label,
+        min_rtt_ms: report.min_rtt_ms,
+        avg_rtt_ms: report.avg_rtt_ms,
+        max_rtt_ms: report.max_rtt_ms,
+        jitter_ms: report.jitter_ms,
+        packet_loss_percent: report.packet_loss_percent,
+        throughput_mbps: report.throughput_mbps,
+        throughput_mbytes_per_sec: report.throughput_mbytes_per_sec,
+        packets_sent: report.packets_sent,
+        packets_received: report.packets_received,
+        bytes_transferred: report.bytes_transferred,
+        duration_ms: report.duration_ms,
+    }
+}
+
+#[tauri::command]
+pub async fn run_tunnel_benchmark(
+    state: tauri::State<'_, AppState>,
+) -> Result<UiBenchmarkResult, String> {
+    match send_ipc_request(&IpcRequest::RunBenchmark).await {
+        Ok(IpcResponse::Benchmark(report)) => return Ok(benchmark_report_to_ui(report)),
+        Ok(IpcResponse::Error { message }) => return Err(message),
+        Err(e) if !e.starts_with("Service IPC unavailable") => return Err(e),
+        _ => {}
+    }
+
+    let m = state.tunnel.run_benchmark().await?;
+    Ok(benchmark_report_to_ui(BenchmarkReport {
+        transport_mode: m.transport_mode,
+        min_rtt_ms: m.min_rtt_ms,
+        avg_rtt_ms: m.avg_rtt_ms,
+        max_rtt_ms: m.max_rtt_ms,
+        jitter_ms: m.jitter_ms,
+        packet_loss_percent: m.packet_loss_percent,
+        throughput_mbps: m.throughput_mbps,
+        throughput_mbytes_per_sec: m.throughput_mbytes_per_sec,
+        packets_sent: m.packets_sent,
+        packets_received: m.packets_received,
+        bytes_transferred: m.bytes_transferred,
+        duration_ms: m.duration_ms,
+    }))
 }
 
 #[cfg(test)]

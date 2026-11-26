@@ -41,6 +41,13 @@ const btnCopyHwid = document.getElementById('btnCopyHwid');
 const btnConnect = document.getElementById('btnConnect');
 const btnDisconnect = document.getElementById('btnDisconnect');
 const btnOpenFolder = document.getElementById('btnOpenFolder');
+const btnRunBenchmark = document.getElementById('btnRunBenchmark');
+const benchmarkCard = document.getElementById('benchmarkCard');
+const benchTransportLabel = document.getElementById('benchTransportLabel');
+const benchThroughput = document.getElementById('benchThroughput');
+const benchRtt = document.getElementById('benchRtt');
+const benchJitter = document.getElementById('benchJitter');
+const benchLoss = document.getElementById('benchLoss');
 const appProfileSelect = document.getElementById('appProfileSelect');
 const targetPeerId = document.getElementById('targetPeerId');
 const driveLetter = document.getElementById('driveLetter');
@@ -485,6 +492,50 @@ if (btnOpenFolder) {
   });
 }
 
+// Run Live P2P Tunnel Speed & Latency Benchmark
+if (btnRunBenchmark) {
+  btnRunBenchmark.addEventListener('click', async () => {
+    btnRunBenchmark.disabled = true;
+    const origText = btnRunBenchmark.textContent;
+    btnRunBenchmark.textContent = 'Testing...';
+    if (benchmarkCard) benchmarkCard.style.display = 'block';
+    if (benchThroughput) benchThroughput.textContent = 'Running...';
+    if (benchRtt) benchRtt.textContent = '...';
+    if (benchJitter) benchJitter.textContent = '...';
+    if (benchLoss) benchLoss.textContent = '...';
+
+    try {
+      const res = await invoke('run_tunnel_benchmark');
+      if (res) {
+        const t = formatTransportDisplay(res.transport_mode, res.transport_mode_label);
+        if (benchTransportLabel) {
+          benchTransportLabel.textContent = t.short;
+          benchTransportLabel.className = t.badgeCls;
+        }
+        if (benchThroughput) {
+          benchThroughput.textContent = `${res.throughput_mbps.toFixed(2)} Mbps (${res.throughput_mbytes_per_sec.toFixed(2)} MB/s)`;
+        }
+        if (benchRtt) {
+          benchRtt.textContent = `${res.min_rtt_ms} / ${res.avg_rtt_ms} / ${res.max_rtt_ms} ms`;
+        }
+        if (benchJitter) {
+          benchJitter.textContent = `${res.jitter_ms} ms`;
+        }
+        if (benchLoss) {
+          benchLoss.textContent = `${res.packet_loss_percent}% (${res.packets_received}/${res.packets_sent})`;
+          benchLoss.style.color = res.packet_loss_percent === 0 ? '#10b981' : (res.packet_loss_percent <= 5 ? '#fbbf24' : '#ef4444');
+        }
+      }
+    } catch (err) {
+      if (benchThroughput) benchThroughput.textContent = 'Failed';
+      alert(`Speed Test Failed:\n${err}`);
+    } finally {
+      btnRunBenchmark.disabled = false;
+      btnRunBenchmark.textContent = origText;
+    }
+  });
+}
+
 // 5. Activate License
 btnActivateLicense.addEventListener('click', async () => {
   const key = licenseInput.value.trim();
@@ -586,6 +637,9 @@ function updateUiStatus(status) {
       btnOpenFolder.style.display = "inline-block";
       btnOpenFolder.textContent = `📂 Open Folder (${status.drive_letter || 'Z'}:)`;
     }
+    if (btnRunBenchmark) {
+      btnRunBenchmark.style.display = "inline-block";
+    }
     const transport = formatTransportDisplay(status.transport_mode, status.transport_mode_label);
     if (metricTransport) {
       metricTransport.textContent = transport.short;
@@ -629,6 +683,8 @@ function updateUiStatus(status) {
     btnConnect.style.display = "inline-block";
     btnDisconnect.style.display = "none";
     if (btnOpenFolder) btnOpenFolder.style.display = "none";
+    if (btnRunBenchmark) btnRunBenchmark.style.display = "none";
+    if (benchmarkCard) benchmarkCard.style.display = "none";
     if (metricTransport) {
       metricTransport.textContent = "--";
       metricTransport.title = "Disconnected";

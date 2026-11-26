@@ -84,7 +84,8 @@ fn main() {
             uninstall_windows_service,
             set_prevent_sleep,
             set_auto_start,
-            trigger_service_reconnect
+            trigger_service_reconnect,
+            run_tunnel_benchmark
         ])
         .run(tauri::generate_context!())
         .expect("error while running t3Bridge application");

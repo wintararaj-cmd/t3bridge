@@ -196,6 +196,27 @@ fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
 type PeerMap = HashMap<Ipv4Addr, Arc<std::sync::Mutex<WgPeerSession>>>;
 type EarlyProbeEntry = (SocketAddr, [u8; 16], u64, std::time::Instant);
 
+/// Unconfirmed peers pre-registered on `HolePunchOffer` that never send `RelayRequest`
+/// or any authenticated packet within this timeout are automatically reaped.
+const UNCONFIRMED_PEER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Measured live tunnel performance metrics from `WintunTunnelAdapter::run_benchmark()`.
+#[derive(Debug, Clone)]
+pub struct TunnelBenchmarkMetrics {
+    pub transport_mode: TransportMode,
+    pub min_rtt_ms: u32,
+    pub avg_rtt_ms: u32,
+    pub max_rtt_ms: u32,
+    pub jitter_ms: u32,
+    pub packet_loss_percent: u8,
+    pub throughput_mbps: f64,
+    pub throughput_mbytes_per_sec: f64,
+    pub packets_sent: u32,
+    pub packets_received: u32,
+    pub bytes_transferred: u64,
+    pub duration_ms: u64,
+}
+
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -235,6 +256,7 @@ pub struct WintunTunnelAdapter {
     wg_peers: Arc<std::sync::RwLock<PeerMap>>,
     session_to_vip: Arc<std::sync::RwLock<HashMap<String, Ipv4Addr>>>,
     early_udp_probes: Arc<std::sync::Mutex<Vec<EarlyProbeEntry>>>,
+    bench_ack_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<(u64, u64)>>>>,
     p2p_gen: Arc<AtomicU64>,
     peer_index_seq: AtomicU32,
 }
@@ -261,6 +283,7 @@ impl WintunTunnelAdapter {
             wg_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             session_to_vip: Arc::new(std::sync::RwLock::new(HashMap::new())),
             early_udp_probes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            bench_ack_tx: Arc::new(std::sync::Mutex::new(None)),
             p2p_gen: Arc::new(AtomicU64::new(0)),
             peer_index_seq: AtomicU32::new(1),
         }
@@ -470,6 +493,7 @@ impl WintunTunnelAdapter {
             Arc::clone(&sock),
             Arc::clone(&self.wg_peers),
             Arc::clone(&self.early_udp_probes),
+            Arc::clone(&self.bench_ack_tx),
             Arc::clone(&self.session),
             Arc::clone(&self.bytes_received),
             Arc::clone(&self.latency_ms),
@@ -486,6 +510,7 @@ impl WintunTunnelAdapter {
                 Arc::clone(s6),
                 Arc::clone(&self.wg_peers),
                 Arc::clone(&self.early_udp_probes),
+                Arc::clone(&self.bench_ack_tx),
                 Arc::clone(&self.session),
                 Arc::clone(&self.bytes_received),
                 Arc::clone(&self.latency_ms),
@@ -497,10 +522,11 @@ impl WintunTunnelAdapter {
             );
         }
 
-        // 2. Spawn WireGuard Timer, UDP-First Promotion Probe, Live RTT & 10s STUN Keepalive Task (250ms tick)
+        // 2. Spawn WireGuard Timer, UDP-First Promotion Probe, Live RTT, Orphan Peer GC & 10s STUN Keepalive Task (250ms tick)
         let sock_timer = Arc::clone(&sock);
         let sock_v6_timer = sock_v6.clone();
         let peers_timer = Arc::clone(&self.wg_peers);
+        let s2v_timer = Arc::clone(&self.session_to_vip);
         let bin_tx_timer = Arc::clone(&self.binary_relay_tx);
         let stun_tx_timer = Arc::clone(&self.active_stun_tx_id);
         let gen_timer = Arc::clone(&self.p2p_gen);
@@ -511,6 +537,12 @@ impl WintunTunnelAdapter {
             while gen_timer.load(Ordering::Relaxed) == gen {
                 interval.tick().await;
                 tick_count = tick_count.wrapping_add(1);
+
+                // Every 4s (16 ticks), reap orphan peers pre-registered on HolePunchOffer
+                // that never received RelayRequest or any authenticated UDP/Relay packet.
+                if tick_count % 16 == 0 {
+                    reap_stale_unconfirmed_peers(&peers_timer, &s2v_timer, UNCONFIRMED_PEER_TIMEOUT);
+                }
 
                 // Every 10s (40 ticks), refresh STUN binding on this exact UDP socket
                 // so Android Mobile Hotspot & CGNAT UDP mappings never expire while idle!
@@ -687,6 +719,7 @@ impl WintunTunnelAdapter {
                 if let Some(existing_mtx) = map.get(&virtual_ip) {
                     if let Ok(mut existing) = existing_mtx.lock() {
                         if existing.session_id == session_id {
+                            existing.mark_confirmed();
                             for c in &candidates {
                                 if !existing.candidates.contains(c) {
                                     existing.candidates.push(*c);
@@ -726,6 +759,10 @@ impl WintunTunnelAdapter {
             peer_idx,
             candidates.clone(),
         );
+        if initiate_handshake {
+            // Client-side peer registration happens after HolePunchAnswer + RelayRequest
+            peer.mark_confirmed();
+        }
 
         let init_pkt = if initiate_handshake {
             peer.initiate_handshake(true)
@@ -781,6 +818,226 @@ impl WintunTunnelAdapter {
         Ok(())
     }
 
+    /// Runs an active, non-disruptive live latency + jitter + packet-loss + burst throughput benchmark
+    /// over the currently active transport path (Direct UDP P2P or Binary WS Cloud Relay).
+    pub async fn run_benchmark(&self) -> Result<TunnelBenchmarkMetrics, String> {
+        let peer_mtx = self
+            .wg_peers
+            .read()
+            .ok()
+            .and_then(|map| {
+                map.get(&Ipv4Addr::new(10, 99, 0, 1))
+                    .cloned()
+                    .or_else(|| map.values().next().cloned())
+            })
+            .ok_or_else(|| "No active WireGuard peer connected for benchmark.".to_string())?;
+
+        let (transport_mode, direct_ep, session_id, probe_token) = {
+            let p = peer_mtx
+                .lock()
+                .map_err(|_| "Peer lock poisoned".to_string())?;
+            (
+                p.active_transport_mode(),
+                p.direct_endpoint,
+                p.session_id.clone(),
+                p.probe_token,
+            )
+        };
+
+        let use_udp = transport_mode == TransportMode::DirectUdpP2p && direct_ep.is_some();
+        let maybe_sock = self.p2p_udp_socket.read().ok().and_then(|g| g.clone());
+        let maybe_sock_v6 = self.p2p_udp_v6_socket.read().ok().and_then(|g| g.clone());
+
+        if use_udp && maybe_sock.is_none() {
+            return Err("P2P UDP socket is not initialized.".into());
+        }
+
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<(u64, u64)>();
+        if let Ok(mut guard) = self.bench_ack_tx.lock() {
+            *guard = Some(ack_tx);
+        }
+
+        // Phase 1: 8 paced RTT probes (64 bytes each) for accurate min/avg/max RTT & jitter
+        const RTT_PROBES: u32 = 8;
+        const BURST_PACKETS: u32 = 128;
+        const BURST_PAYLOAD_LEN: usize = 1200;
+        const BURST_TAG_FLAG: u64 = 1u64 << 63;
+
+        let mut rtt_sent_at: HashMap<u64, u64> = HashMap::new();
+        let mut rtt_samples: Vec<u32> = Vec::with_capacity(RTT_PROBES as usize);
+
+        for seq in 1..=(RTT_PROBES as u64) {
+            let sent_ms = now_epoch_ms();
+            rtt_sent_at.insert(seq, sent_ms);
+            let pkt = crate::tunnel::wireguard_peer::encode_bench_payload(&probe_token, seq, 64);
+            if use_udp {
+                if let (Some(ref sock), Some(ep)) = (&maybe_sock, direct_ep) {
+                    send_p2p_datagram(sock, maybe_sock_v6.as_deref(), &pkt, ep).await;
+                }
+            } else {
+                send_binary_fallback(&self.binary_relay_tx, &session_id, &pkt);
+            }
+            // Wait up to 60ms between paced probes while draining incoming ACKs
+            let step_deadline = tokio::time::Instant::now() + Duration::from_millis(60);
+            while let Ok(Some((tag, rx_ms))) = timeout(
+                step_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                ack_rx.recv(),
+            )
+            .await
+            {
+                if (tag & BURST_TAG_FLAG) == 0 {
+                    if let Some(t0) = rtt_sent_at.remove(&tag) {
+                        rtt_samples.push(rx_ms.saturating_sub(t0).clamp(1, 5000) as u32);
+                    }
+                }
+            }
+        }
+
+        // Drain any remaining RTT ACKs for up to 500ms
+        let rtt_drain_end = tokio::time::Instant::now() + Duration::from_millis(500);
+        while !rtt_sent_at.is_empty() {
+            let rem = rtt_drain_end.saturating_duration_since(tokio::time::Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            match timeout(rem, ack_rx.recv()).await {
+                Ok(Some((tag, rx_ms))) => {
+                    if (tag & BURST_TAG_FLAG) == 0 {
+                        if let Some(t0) = rtt_sent_at.remove(&tag) {
+                            rtt_samples.push(rx_ms.saturating_sub(t0).clamp(1, 5000) as u32);
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // Phase 2: Burst Throughput (128 x 1200B = 153.6 KB, gently paced to avoid local OS drops)
+        let burst_start = std::time::Instant::now();
+        let mut first_ack_time: Option<std::time::Instant> = None;
+        let mut last_ack_time: Option<std::time::Instant> = None;
+        let mut burst_acked: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(BURST_PACKETS as usize);
+
+        for seq in 0..(BURST_PACKETS as u64) {
+            let tag = BURST_TAG_FLAG | seq;
+            let pkt = crate::tunnel::wireguard_peer::encode_bench_payload(
+                &probe_token,
+                tag,
+                BURST_PAYLOAD_LEN,
+            );
+            if use_udp {
+                if let (Some(ref sock), Some(ep)) = (&maybe_sock, direct_ep) {
+                    send_p2p_datagram(sock, maybe_sock_v6.as_deref(), &pkt, ep).await;
+                }
+            } else {
+                send_binary_fallback(&self.binary_relay_tx, &session_id, &pkt);
+            }
+            // Drain any ready ACKs without blocking
+            while let Ok((rx_tag, _)) = ack_rx.try_recv() {
+                if (rx_tag & BURST_TAG_FLAG) != 0 && burst_acked.insert(rx_tag) {
+                    let now = std::time::Instant::now();
+                    if first_ack_time.is_none() {
+                        first_ack_time = Some(now);
+                    }
+                    last_ack_time = Some(now);
+                }
+            }
+            if seq % 8 == 7 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        // Collect remaining burst ACKs up to 1200ms after last packet sent (or 250ms idle gap)
+        let burst_deadline = tokio::time::Instant::now() + Duration::from_millis(1200);
+        while burst_acked.len() < BURST_PACKETS as usize {
+            let rem = burst_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            let wait = rem.min(Duration::from_millis(350));
+            match timeout(wait, ack_rx.recv()).await {
+                Ok(Some((rx_tag, _))) => {
+                    if (rx_tag & BURST_TAG_FLAG) != 0 && burst_acked.insert(rx_tag) {
+                        let now = std::time::Instant::now();
+                        if first_ack_time.is_none() {
+                            first_ack_time = Some(now);
+                        }
+                        last_ack_time = Some(now);
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // Clear active benchmark receiver
+        if let Ok(mut guard) = self.bench_ack_tx.lock() {
+            *guard = None;
+        }
+
+        let packets_sent = RTT_PROBES + BURST_PACKETS;
+        let packets_received = (rtt_samples.len() + burst_acked.len()) as u32;
+        let lost = packets_sent.saturating_sub(packets_received);
+        let packet_loss_percent = ((lost * 100) / packets_sent.max(1)).min(100) as u8;
+
+        let (min_rtt_ms, avg_rtt_ms, max_rtt_ms, jitter_ms) = if rtt_samples.is_empty() {
+            let fallback_rtt = self.latency_ms.load(Ordering::Relaxed);
+            (fallback_rtt, fallback_rtt, fallback_rtt, 0)
+        } else {
+            let min = *rtt_samples.iter().min().unwrap_or(&0);
+            let max = *rtt_samples.iter().max().unwrap_or(&0);
+            let sum: u64 = rtt_samples.iter().map(|v| *v as u64).sum();
+            let avg = (sum / rtt_samples.len() as u64) as u32;
+            let mut jitter_sum: u64 = 0;
+            for w in rtt_samples.windows(2) {
+                jitter_sum += w[0].abs_diff(w[1]) as u64;
+            }
+            let jitter = if rtt_samples.len() > 1 {
+                (jitter_sum / (rtt_samples.len() - 1) as u64) as u32
+            } else {
+                0
+            };
+            (min, avg, max, jitter)
+        };
+
+        let bytes_transferred = (burst_acked.len() as u64) * (BURST_PAYLOAD_LEN as u64);
+        // Effective transfer window: prefer total burst_start -> last_ack_time minus half-RTT
+        let total_burst_ms = last_ack_time
+            .map(|t| t.saturating_duration_since(burst_start).as_millis() as u64)
+            .unwrap_or(0)
+            .max(1);
+        let secs = (total_burst_ms as f64) / 1000.0;
+        let throughput_mbytes_per_sec = if bytes_transferred > 0 {
+            ((bytes_transferred as f64) / (1024.0 * 1024.0)) / secs
+        } else {
+            0.0
+        };
+        let throughput_mbps = if bytes_transferred > 0 {
+            ((bytes_transferred as f64 * 8.0) / 1_000_000.0) / secs
+        } else {
+            0.0
+        };
+
+        if avg_rtt_ms > 0 {
+            self.latency_ms.store(avg_rtt_ms, Ordering::Relaxed);
+        }
+
+        Ok(TunnelBenchmarkMetrics {
+            transport_mode,
+            min_rtt_ms,
+            avg_rtt_ms,
+            max_rtt_ms,
+            jitter_ms,
+            packet_loss_percent,
+            throughput_mbps: (throughput_mbps * 100.0).round() / 100.0,
+            throughput_mbytes_per_sec: (throughput_mbytes_per_sec * 100.0).round() / 100.0,
+            packets_sent,
+            packets_received,
+            bytes_transferred,
+            duration_ms: total_burst_ms,
+        })
+    }
+
     /// Removes a WireGuard peer when its session closes (ignores stale RelayClose from superseded sessions).
     pub fn remove_wg_peer_by_session(&self, session_id: &str) {
         let maybe_vip = self
@@ -827,22 +1084,45 @@ impl WintunTunnelAdapter {
             return;
         };
 
-        // Handle out-of-band Relay RTT probes without touching boringtun or promoting Direct UDP
+        // Handle out-of-band Relay RTT & Benchmark probes without touching boringtun or promoting Direct UDP
         if let Some((probe_kind, probe_token, ts_ms)) = decode_p2p_probe(payload) {
-            if matches!(probe_kind, P2pProbeKind::RelayPing | P2pProbeKind::RelayPong) {
-                let maybe_pong = match peer_mtx.lock() {
+            if matches!(
+                probe_kind,
+                P2pProbeKind::RelayPing
+                    | P2pProbeKind::RelayPong
+                    | P2pProbeKind::BenchPayload
+                    | P2pProbeKind::BenchAck
+            ) {
+                let maybe_reply = match peer_mtx.lock() {
                     Ok(mut peer) => {
                         if peer.matches_probe_token(&probe_token) {
                             peer.mark_relay_rx();
-                            if probe_kind == P2pProbeKind::RelayPing {
-                                Some(peer.build_probe(P2pProbeKind::RelayPong, ts_ms))
-                            } else {
-                                if !peer.is_direct_udp_active() {
-                                    let rtt =
-                                        now_epoch_ms().saturating_sub(ts_ms).clamp(1, 5000) as u32;
-                                    self.latency_ms.store(rtt, Ordering::Relaxed);
+                            match probe_kind {
+                                P2pProbeKind::RelayPing => {
+                                    Some(peer.build_probe(P2pProbeKind::RelayPong, ts_ms))
                                 }
-                                None
+                                P2pProbeKind::RelayPong => {
+                                    if !peer.is_direct_udp_active() {
+                                        let rtt = now_epoch_ms()
+                                            .saturating_sub(ts_ms)
+                                            .clamp(1, 5000)
+                                            as u32;
+                                        self.latency_ms.store(rtt, Ordering::Relaxed);
+                                    }
+                                    None
+                                }
+                                P2pProbeKind::BenchPayload => {
+                                    Some(peer.build_probe(P2pProbeKind::BenchAck, ts_ms))
+                                }
+                                P2pProbeKind::BenchAck => {
+                                    if let Ok(guard) = self.bench_ack_tx.lock() {
+                                        if let Some(ref tx) = *guard {
+                                            let _ = tx.send((ts_ms, now_epoch_ms()));
+                                        }
+                                    }
+                                    None
+                                }
+                                _ => None,
                             }
                         } else {
                             None
@@ -850,8 +1130,8 @@ impl WintunTunnelAdapter {
                     }
                     Err(_) => None,
                 };
-                if let Some(pong) = maybe_pong {
-                    send_binary_fallback(&self.binary_relay_tx, session_id, &pong);
+                if let Some(reply) = maybe_reply {
+                    send_binary_fallback(&self.binary_relay_tx, session_id, &reply);
                 }
             }
             return;
@@ -927,10 +1207,60 @@ impl WintunTunnelAdapter {
     }
 }
 
+/// Reaps unconfirmed peers pre-registered on `HolePunchOffer` that never sent `RelayRequest`
+/// or any authenticated packet within `timeout`, preventing unbounded peer/timer leaks.
+fn reap_stale_unconfirmed_peers(
+    wg_peers: &std::sync::RwLock<PeerMap>,
+    session_to_vip: &std::sync::RwLock<HashMap<String, Ipv4Addr>>,
+    timeout: Duration,
+) -> usize {
+    let stale: Vec<(Ipv4Addr, String)> = {
+        let Ok(map) = wg_peers.read() else {
+            return 0;
+        };
+        map.iter()
+            .filter_map(|(vip, mtx)| {
+                mtx.lock().ok().and_then(|p| {
+                    if p.is_stale_unconfirmed(timeout) {
+                        Some((*vip, p.session_id.clone()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
+    };
+
+    if stale.is_empty() {
+        return 0;
+    }
+
+    let mut removed = 0usize;
+    if let Ok(mut map) = wg_peers.write() {
+        for (vip, sid) in &stale {
+            let matches_sid = map
+                .get(vip)
+                .and_then(|m| m.lock().ok().map(|p| p.session_id == *sid))
+                .unwrap_or(false);
+            if matches_sid {
+                map.remove(vip);
+                removed += 1;
+            }
+        }
+    }
+    if let Ok(mut s2v) = session_to_vip.write() {
+        for (_, sid) in &stale {
+            s2v.remove(sid);
+        }
+    }
+    removed
+}
+
 fn spawn_udp_receiver_task(
     sock_rx: Arc<UdpSocket>,
     peers_rx: Arc<std::sync::RwLock<PeerMap>>,
     early_probes_rx: Arc<std::sync::Mutex<Vec<EarlyProbeEntry>>>,
+    bench_ack_rx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<(u64, u64)>>>>,
     session_rx: Arc<std::sync::RwLock<Option<Arc<wintun::Session>>>>,
     bytes_rx: Arc<AtomicU64>,
     latency_rx: Arc<AtomicU32>,
@@ -942,6 +1272,7 @@ fn spawn_udp_receiver_task(
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
+        let mut decap_buf = vec![0u8; 4096];
         while gen_rx.load(Ordering::Relaxed) == gen {
             let recv = timeout(Duration::from_secs(2), sock_rx.recv_from(&mut buf)).await;
             let (len, mut src) = match recv {
@@ -986,10 +1317,16 @@ fn spawn_udp_receiver_task(
                 }
             };
 
-            // (b) Check for authenticated UDP-only P2P_PING / P2P_PONG probe
+            // (b) Check for authenticated UDP-only P2P_PING / P2P_PONG / Bench probes
             //     (Bypasses boringtun anti-replay counters so Direct UDP promotes reliably!)
             if let Some((probe_kind, probe_token, ts_ms)) = decode_p2p_probe(packet) {
-                if matches!(probe_kind, P2pProbeKind::UdpPing | P2pProbeKind::UdpPong) {
+                if matches!(
+                    probe_kind,
+                    P2pProbeKind::UdpPing
+                        | P2pProbeKind::UdpPong
+                        | P2pProbeKind::BenchPayload
+                        | P2pProbeKind::BenchAck
+                ) {
                     let mut matched_any = false;
                     for peer_mtx in peer_list {
                         let reply_opt = match peer_mtx.lock() {
@@ -997,15 +1334,30 @@ fn spawn_udp_receiver_task(
                                 if peer.matches_probe_token(&probe_token) {
                                     matched_any = true;
                                     peer.mark_direct_rx(src);
-                                    if probe_kind == P2pProbeKind::UdpPing {
-                                        Some(peer.build_probe(P2pProbeKind::UdpPong, ts_ms))
-                                    } else {
-                                        let rtt = now_epoch_ms()
-                                            .saturating_sub(ts_ms)
-                                            .clamp(1, 5000)
-                                            as u32;
-                                        latency_rx.store(rtt, Ordering::Relaxed);
-                                        None
+                                    match probe_kind {
+                                        P2pProbeKind::UdpPing => {
+                                            Some(peer.build_probe(P2pProbeKind::UdpPong, ts_ms))
+                                        }
+                                        P2pProbeKind::UdpPong => {
+                                            let rtt = now_epoch_ms()
+                                                .saturating_sub(ts_ms)
+                                                .clamp(1, 5000)
+                                                as u32;
+                                            latency_rx.store(rtt, Ordering::Relaxed);
+                                            None
+                                        }
+                                        P2pProbeKind::BenchPayload => {
+                                            Some(peer.build_probe(P2pProbeKind::BenchAck, ts_ms))
+                                        }
+                                        P2pProbeKind::BenchAck => {
+                                            if let Ok(guard) = bench_ack_rx.lock() {
+                                                if let Some(ref tx) = *guard {
+                                                    let _ = tx.send((ts_ms, now_epoch_ms()));
+                                                }
+                                            }
+                                            None
+                                        }
+                                        _ => None,
                                     }
                                 } else {
                                     continue;
@@ -1014,8 +1366,8 @@ fn spawn_udp_receiver_task(
                             Err(_) => continue,
                         };
 
-                        if let Some(pong) = reply_opt {
-                            let _ = sock_rx.send_to(&pong, src).await;
+                        if let Some(reply) = reply_opt {
+                            let _ = sock_rx.send_to(&reply, src).await;
                         }
                         break;
                     }
@@ -1034,12 +1386,13 @@ fn spawn_udp_receiver_task(
                 continue;
             }
 
-            // (c) Standard WireGuard encrypted datagram
+            // (c) Standard WireGuard encrypted datagram (reusing scratch buffer)
             for peer_mtx in peer_list {
                 let decap = {
                     match peer_mtx.lock() {
                         Ok(mut peer) => {
-                            let out = peer.decapsulate_wg(Some(src.ip()), packet);
+                            let out =
+                                peer.decapsulate_wg_with_buf(Some(src.ip()), packet, &mut decap_buf);
                             if out.authenticated {
                                 peer.mark_direct_rx(src);
                             }
@@ -1087,16 +1440,17 @@ fn try_send_p2p_datagram(
     payload: &[u8],
     target: SocketAddr,
 ) {
-    match target {
-        SocketAddr::V4(_) => {
-            if let Some(sock) = sock_v4_lock.read().ok().and_then(|g| g.clone()) {
-                let _ = sock.try_send_to(payload, target);
-            }
-        }
-        SocketAddr::V6(_) => {
-            if let Some(sock6) = sock_v6_lock.read().ok().and_then(|g| g.clone()) {
-                let _ = sock6.try_send_to(payload, target);
-            }
+    let sock_opt = match target {
+        SocketAddr::V4(_) => sock_v4_lock.read().ok().and_then(|g| g.clone()),
+        SocketAddr::V6(_) => sock_v6_lock.read().ok().and_then(|g| g.clone()),
+    };
+    let Some(sock) = sock_opt else {
+        return;
+    };
+    if let Err(e) = sock.try_send_to(payload, target) {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            std::thread::yield_now();
+            let _ = sock.try_send_to(payload, target);
         }
     }
 }
@@ -1501,10 +1855,15 @@ impl TunnelPort for WintunTunnelAdapter {
         let wg_peers_ref = Arc::clone(&self.wg_peers);
 
         std::thread::spawn(move || {
+            // Reusable scratch buffers eliminate per-packet heap allocations on the SMB/DBF hot path
+            let mut pkt_buf: Vec<u8> = Vec::with_capacity(2048);
+            let mut wg_out_buf: Vec<u8> = vec![0u8; 65536];
+
             while is_running.load(Ordering::Relaxed) {
                 match s_clone.receive_blocking() {
                     Ok(packet) => {
-                        let mut data = packet.bytes().to_vec();
+                        pkt_buf.clear();
+                        pkt_buf.extend_from_slice(packet.bytes());
 
                         // Fast-path: WireGuard (boringtun) encrypted P2P UDP + Binary WS fallback
                         let has_wg_peers = wg_peers_ref
@@ -1513,14 +1872,14 @@ impl TunnelPort for WintunTunnelAdapter {
                             .unwrap_or(false);
 
                         if has_wg_peers {
-                            let Some(dst_ip) = extract_routable_ipv4_dst(&data) else {
+                            let Some(dst_ip) = extract_routable_ipv4_dst(&pkt_buf) else {
                                 // Drop non-IPv4, multicast, broadcast, and OS discovery chatter
                                 continue;
                             };
 
                             // Clamp TCP MSS on SYN packets so SMB never fragments
-                            clamp_tcp_mss(&mut data, WIREGUARD_TCP_MSS);
-                            bytes_sent_counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            clamp_tcp_mss(&mut pkt_buf, WIREGUARD_TCP_MSS);
+                            bytes_sent_counter.fetch_add(pkt_buf.len() as u64, Ordering::Relaxed);
 
                             let peer_opt = wg_peers_ref
                                 .read()
@@ -1528,35 +1887,33 @@ impl TunnelPort for WintunTunnelAdapter {
                                 .and_then(|m| m.get(&dst_ip).cloned());
 
                             if let Some(peer_mtx) = peer_opt {
-                                let send_plan = {
-                                    match peer_mtx.lock() {
-                                        Ok(mut peer) => peer.encapsulate_ipv4(&data).map(|wg_pkt| {
-                                            (
-                                                wg_pkt,
-                                                peer.is_direct_udp_active(),
-                                                peer.direct_endpoint,
-                                                peer.session_id.clone(),
-                                            )
-                                        }),
-                                        Err(_) => None,
+                                if let Ok(mut peer) = peer_mtx.lock() {
+                                    let needed = pkt_buf.len() + 148;
+                                    if wg_out_buf.len() < needed {
+                                        wg_out_buf.resize(needed, 0);
                                     }
-                                };
-
-                                if let Some((wg_pkt, direct_active, direct_ep, sid)) = send_plan {
-                                    if direct_active {
-                                        // Direct P2P UDP (IPv4 or IPv6) active: 100% peer-to-peer, zero bytes go to Cloud Relay!
-                                        if let Some(ep) = direct_ep {
-                                            try_send_p2p_datagram(
-                                                &p2p_sock_ref,
-                                                &p2p_sock_v6_ref,
-                                                &wg_pkt,
-                                                ep,
+                                    let direct_active = peer.is_direct_udp_active();
+                                    let direct_ep = peer.direct_endpoint;
+                                    if let Some(wg_slice) =
+                                        peer.encapsulate_ipv4_into(&pkt_buf, &mut wg_out_buf)
+                                    {
+                                        if direct_active {
+                                            // Zero-alloc Direct P2P UDP send (no Vec copy, no String clone!)
+                                            if let Some(ep) = direct_ep {
+                                                try_send_p2p_datagram(
+                                                    &p2p_sock_ref,
+                                                    &p2p_sock_v6_ref,
+                                                    wg_slice,
+                                                    ep,
+                                                );
+                                            }
+                                        } else {
+                                            send_binary_fallback(
+                                                &bin_tx_ref,
+                                                &peer.session_id,
+                                                wg_slice,
                                             );
                                         }
-                                    } else {
-                                        // Relay Fallback while UDP P2P_PING probes negotiate direct NAT path
-                                        // (avoids duplicating WireGuard nonces across both paths)
-                                        send_binary_fallback(&bin_tx_ref, &sid, &wg_pkt);
                                     }
                                 }
                             }
@@ -1564,17 +1921,17 @@ impl TunnelPort for WintunTunnelAdapter {
                         }
 
                         // Legacy fallback path (LAN or older host without WireGuard pubkey)
-                        bytes_sent_counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        bytes_sent_counter.fetch_add(pkt_buf.len() as u64, Ordering::Relaxed);
 
                         if let Ok(guard) = udp_ref.try_lock() {
                             if let Some(socket) = guard.as_ref() {
-                                let _ = socket.try_send(&data);
+                                let _ = socket.try_send(&pkt_buf);
                             }
                         }
 
                         if let Ok(guard) = outbound_tx_ref.read() {
                             if let Some(tx) = guard.as_ref() {
-                                let _ = tx.send(data);
+                                let _ = tx.send(pkt_buf.clone());
                             }
                         }
                     }
@@ -1632,6 +1989,9 @@ impl TunnelPort for WintunTunnelAdapter {
         }
         if let Ok(mut guard) = self.early_udp_probes.lock() {
             guard.clear();
+        }
+        if let Ok(mut guard) = self.bench_ack_tx.lock() {
+            *guard = None;
         }
         if let Ok(mut guard) = self.outbound_tx.write() {
             *guard = None;
@@ -1830,6 +2190,32 @@ mod tests {
             "Expected live measured RTT >= 1ms, got {}",
             client_metrics.latency_ms
         );
+
+        // Run live end-to-end tunnel benchmark over promoted Direct UDP loopback
+        let bench = client.run_benchmark().await.expect("benchmark should succeed");
+        assert_eq!(bench.transport_mode, TransportMode::DirectUdpP2p);
+        assert!(bench.packets_received >= 100, "expected >=100 acked packets, got {}", bench.packets_received);
+        assert!(bench.throughput_mbps > 0.0, "expected positive throughput, got {}", bench.throughput_mbps);
+        assert!(bench.avg_rtt_ms >= 1);
+
+        // Verify orphan unconfirmed peer reaping cleans up leaked HolePunchOffer peers
+        let orphan_client = WintunTunnelAdapter::new();
+        let orphan_vip = Ipv4Addr::new(10, 99, 0, 99);
+        host.register_wg_peer(
+            orphan_vip,
+            "sess_tok_orphan_99".into(),
+            &orphan_client.local_wg_pubkey_b64(),
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(host.wg_peers.read().unwrap().contains_key(&orphan_vip));
+        let reaped = reap_stale_unconfirmed_peers(&host.wg_peers, &host.session_to_vip, Duration::from_secs(0));
+        assert_eq!(reaped, 1);
+        assert!(!host.wg_peers.read().unwrap().contains_key(&orphan_vip));
+        // Confirmed active client peer (10.99.0.2) must NOT be reaped!
+        assert!(host.wg_peers.read().unwrap().contains_key(&Ipv4Addr::new(10, 99, 0, 2)));
 
         let _ = host.disconnect().await;
         let _ = client.disconnect().await;

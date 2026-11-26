@@ -20,9 +20,9 @@ use t3_domain::{
 };
 use t3_ipc::{
     generate_salt, get_shared_data_dir, get_shared_license_path, hash_password_with_salt,
-    load_service_config, protect_secret, save_service_config, unprotect_secret, ClientSnapshot,
-    ConnectionPhase, HostSnapshot, IpcRequest, IpcResponse, LicenseSnapshot, ServiceConfig,
-    ServiceMode, ServiceSnapshot, DEFAULT_SIGNALING_URL,
+    load_service_config, protect_secret, save_service_config, unprotect_secret, BenchmarkReport,
+    ClientSnapshot, ConnectionPhase, HostSnapshot, IpcRequest, IpcResponse, LicenseSnapshot,
+    ServiceConfig, ServiceMode, ServiceSnapshot, DEFAULT_SIGNALING_URL,
 };
 use tokio::sync::Mutex;
 
@@ -521,10 +521,17 @@ impl ServiceEngine {
                     }
                 });
 
-                let mut authorized_tokens = HashSet::<String>::new();
+                let mut authorized_tokens =
+                    std::collections::HashMap::<String, std::time::Instant>::new();
                 let mut pending_wg_peers = std::collections::HashMap::<
                     String,
-                    (Option<String>, Option<String>, String, Option<String>),
+                    (
+                        Option<String>,
+                        Option<String>,
+                        String,
+                        Option<String>,
+                        std::time::Instant,
+                    ),
                 >::new();
                 let mut vip_to_session = std::collections::HashMap::<String, String>::new();
 
@@ -538,7 +545,7 @@ impl ServiceEngine {
                                 .strip_prefix("sess_tok_")
                                 .map(|t| t.to_string());
                             let is_authenticated = if let Some(ref tok) = matched_token {
-                                authorized_tokens.remove(tok)
+                                authorized_tokens.remove(tok).is_some()
                             } else {
                                 let incoming_pwd = session_id
                                     .split_once("::AUTH_")
@@ -571,13 +578,14 @@ impl ServiceEngine {
                             clients.insert(session_id.clone());
                             *active_session.lock().await = Some(session_id.clone());
 
-                            // Register WireGuard (boringtun) P2P peer if client provided WG pubkey + VIP
+                            // Register / confirm WireGuard (boringtun) P2P peer if client provided WG pubkey + VIP
                             if let Some(ref tok) = matched_token {
                                 if let Some((
                                     Some(client_wg_pub),
                                     Some(client_vip_str),
                                     client_pub_ep,
                                     client_local_ep,
+                                    _,
                                 )) = pending_wg_peers.remove(tok)
                                 {
                                     if let Some(old_sid) =
@@ -613,6 +621,13 @@ impl ServiceEngine {
                             target_peer_id: _,
                             offer,
                         } => {
+                            // Prune stale unconfirmed tokens/offers older than 30s to avoid memory growth
+                            authorized_tokens
+                                .retain(|_, created| created.elapsed() < std::time::Duration::from_secs(30));
+                            pending_wg_peers.retain(|_, (_, _, _, _, created)| {
+                                created.elapsed() < std::time::Duration::from_secs(30)
+                            });
+
                             let parsed_offer =
                                 t3_domain::parse_client_offer_meta(&offer.wireguard_pubkey);
 
@@ -645,7 +660,8 @@ impl ServiceEngine {
                                 .map(|_| format!("{:02x}", rand::random::<u8>()))
                                 .collect();
                             let pre_session_id = format!("sess_tok_{}", token);
-                            authorized_tokens.insert(token.clone());
+                            let now_inst = std::time::Instant::now();
+                            authorized_tokens.insert(token.clone(), now_inst);
                             pending_wg_peers.insert(
                                 token.clone(),
                                 (
@@ -653,6 +669,7 @@ impl ServiceEngine {
                                     parsed_offer.virtual_ip.clone(),
                                     offer.public_endpoint.clone(),
                                     offer.local_candidate.clone(),
+                                    now_inst,
                                 ),
                             );
 
@@ -1180,15 +1197,15 @@ impl ServiceEngine {
                 NetworkWatchdogUseCase::new(Arc::clone(&self.tunnel) as Arc<dyn TunnelPort>);
             let report = watchdog.check_health().await.unwrap_or_else(|_| {
                 t3_application::usecases::WatchdogReport {
-                    health: ConnectionHealth::Optimal,
+                    health: ConnectionHealth::Dead,
                     metrics: TunnelMetrics {
-                        latency_ms: 15,
+                        latency_ms: 0,
                         bytes_sent: 0,
                         bytes_received: 0,
-                        packet_loss_percent: 0,
+                        packet_loss_percent: 100,
                     },
-                    is_safe: true,
-                    recommendation: None,
+                    is_safe: false,
+                    recommendation: Some("Network watchdog unavailable.".into()),
                 }
             });
             (
@@ -1593,6 +1610,23 @@ impl ServiceEngine {
                     message: "Reconnect triggered".into(),
                 }
             }
+            IpcRequest::RunBenchmark => match self.tunnel.run_benchmark().await {
+                Ok(m) => IpcResponse::Benchmark(BenchmarkReport {
+                    transport_mode: m.transport_mode,
+                    min_rtt_ms: m.min_rtt_ms,
+                    avg_rtt_ms: m.avg_rtt_ms,
+                    max_rtt_ms: m.max_rtt_ms,
+                    jitter_ms: m.jitter_ms,
+                    packet_loss_percent: m.packet_loss_percent,
+                    throughput_mbps: m.throughput_mbps,
+                    throughput_mbytes_per_sec: m.throughput_mbytes_per_sec,
+                    packets_sent: m.packets_sent,
+                    packets_received: m.packets_received,
+                    bytes_transferred: m.bytes_transferred,
+                    duration_ms: m.duration_ms,
+                }),
+                Err(e) => IpcResponse::Error { message: e },
+            },
         }
     }
 }

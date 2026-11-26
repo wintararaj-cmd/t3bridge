@@ -60,6 +60,22 @@ pub struct ClientSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkReport {
+    pub transport_mode: TransportMode,
+    pub min_rtt_ms: u32,
+    pub avg_rtt_ms: u32,
+    pub max_rtt_ms: u32,
+    pub jitter_ms: u32,
+    pub packet_loss_percent: u8,
+    pub throughput_mbps: f64,
+    pub throughput_mbytes_per_sec: f64,
+    pub packets_sent: u32,
+    pub packets_received: u32,
+    pub bytes_transferred: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LicenseSnapshot {
     pub is_licensed: bool,
     pub is_trial: bool,
@@ -149,6 +165,7 @@ pub enum IpcRequest {
         enabled: bool,
     },
     TriggerReconnect,
+    RunBenchmark,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +173,7 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     Pong,
     Status(ServiceSnapshot),
+    Benchmark(BenchmarkReport),
     ServiceConfig(ServiceConfig),
     HardwareId(String),
     LicenseStatus(LicenseSnapshot),

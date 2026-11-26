@@ -26,6 +26,8 @@ pub enum P2pProbeKind {
     UdpPong = 2,
     RelayPing = 3,
     RelayPong = 4,
+    BenchPayload = 5,
+    BenchAck = 6,
 }
 
 impl P2pProbeKind {
@@ -35,24 +37,22 @@ impl P2pProbeKind {
             2 => Some(Self::UdpPong),
             3 => Some(Self::RelayPing),
             4 => Some(Self::RelayPong),
+            5 => Some(Self::BenchPayload),
+            6 => Some(Self::BenchAck),
             _ => None,
         }
     }
 }
 
-/// Derives a symmetric 16-byte probe authentication token from `session_id` and both
-/// peers' X25519 public keys (sorted lexicographically so Host & Client derive the exact same token).
-pub fn derive_p2p_probe_token(session_id: &str, pub_a: &[u8; 32], pub_b: &[u8; 32]) -> [u8; 16] {
-    let (first, second) = if pub_a <= pub_b {
-        (pub_a, pub_b)
-    } else {
-        (pub_b, pub_a)
-    };
+/// Derives a symmetric 16-byte probe authentication token from `session_id` and the
+/// X25519 Diffie-Hellman shared secret between Host and Client.
+/// Because the shared secret never crosses the signaling server, even a compromised
+/// signaling server cannot forge P2P probes or hijack endpoints.
+pub fn derive_p2p_probe_token(session_id: &str, dh_shared_secret: &[u8; 32]) -> [u8; 16] {
     let mut hasher = Sha256::new();
-    hasher.update(b"t3Bridge-P2P-Probe-v1:");
+    hasher.update(b"t3Bridge-P2P-Probe-v2-DH:");
     hasher.update(session_id.as_bytes());
-    hasher.update(first);
-    hasher.update(second);
+    hasher.update(dh_shared_secret);
     let digest = hasher.finalize();
     let mut token = [0u8; 16];
     token.copy_from_slice(&digest[..16]);
@@ -60,7 +60,7 @@ pub fn derive_p2p_probe_token(session_id: &str, pub_a: &[u8; 32], pub_b: &[u8; 3
 }
 
 /// Encodes an authenticated 27-byte P2P/Relay probe packet:
-/// `[0x54, 0x33][kind: 1B][token: 16B][timestamp_ms: 8B BE]`
+/// `[0x54, 0x33][kind: 1B][token: 16B][timestamp_or_tag: 8B BE]`
 pub fn encode_p2p_probe(kind: P2pProbeKind, token: &[u8; 16], ts_ms: u64) -> [u8; P2P_PROBE_LEN] {
     let mut out = [0u8; P2P_PROBE_LEN];
     out[0..2].copy_from_slice(&P2P_PROBE_MAGIC);
@@ -70,12 +70,26 @@ pub fn encode_p2p_probe(kind: P2pProbeKind, token: &[u8; 16], ts_ms: u64) -> [u8
     out
 }
 
-/// Decodes a 27-byte P2P/Relay probe packet. Returns `None` for WireGuard/STUN/garbage packets.
+/// Encodes an authenticated variable-length benchmark packet (`BenchPayload`):
+/// `[27-byte probe header][deterministic fill bytes up to total_len]`.
+pub fn encode_bench_payload(token: &[u8; 16], tag: u64, total_len: usize) -> Vec<u8> {
+    let len = total_len.max(P2P_PROBE_LEN).min(1340);
+    let mut out = vec![0xA5u8; len];
+    let hdr = encode_p2p_probe(P2pProbeKind::BenchPayload, token, tag);
+    out[..P2P_PROBE_LEN].copy_from_slice(&hdr);
+    out
+}
+
+/// Decodes an authenticated P2P/Relay/Benchmark probe packet.
+/// Returns `None` for WireGuard/STUN/garbage packets.
 pub fn decode_p2p_probe(buf: &[u8]) -> Option<(P2pProbeKind, [u8; 16], u64)> {
-    if buf.len() != P2P_PROBE_LEN || buf[0..2] != P2P_PROBE_MAGIC {
+    if buf.len() < P2P_PROBE_LEN || buf[0..2] != P2P_PROBE_MAGIC {
         return None;
     }
     let kind = P2pProbeKind::from_byte(buf[2])?;
+    if kind != P2pProbeKind::BenchPayload && buf.len() != P2P_PROBE_LEN {
+        return None;
+    }
     let mut token = [0u8; 16];
     token.copy_from_slice(&buf[3..19]);
     let ts_ms = u64::from_be_bytes([
@@ -146,6 +160,7 @@ pub struct WgPeerSession {
     pub direct_endpoint: Option<SocketAddr>,
     pub candidates: Vec<SocketAddr>,
     pub created_at: Instant,
+    pub confirmed: bool,
     pub last_direct_rx: Option<Instant>,
     pub last_relay_rx: Option<Instant>,
 }
@@ -159,9 +174,8 @@ impl WgPeerSession {
         peer_index: u32,
         candidates: Vec<SocketAddr>,
     ) -> Self {
-        let local_public = PublicKey::from(&local_secret);
-        let probe_token =
-            derive_p2p_probe_token(&session_id, local_public.as_bytes(), remote_public.as_bytes());
+        let shared_secret = local_secret.diffie_hellman(&remote_public);
+        let probe_token = derive_p2p_probe_token(&session_id, shared_secret.as_bytes());
 
         let tunn = Tunn::new(
             local_secret,
@@ -180,9 +194,24 @@ impl WgPeerSession {
             direct_endpoint: candidates.first().copied(),
             candidates,
             created_at: Instant::now(),
+            confirmed: false,
             last_direct_rx: None,
             last_relay_rx: None,
         }
+    }
+
+    /// Marks this peer session as confirmed (e.g. after `RelayRequest` or client-side registration).
+    pub fn mark_confirmed(&mut self) {
+        self.confirmed = true;
+    }
+
+    /// Returns `true` if this peer was pre-registered on `HolePunchOffer` but never confirmed
+    /// by `RelayRequest` and never sent any authenticated UDP/Relay traffic within `timeout`.
+    pub fn is_stale_unconfirmed(&self, timeout: Duration) -> bool {
+        !self.confirmed
+            && self.last_direct_rx.is_none()
+            && self.last_relay_rx.is_none()
+            && self.created_at.elapsed() >= timeout
     }
 
     /// Constant-time check whether a received probe token authenticates this peer.
@@ -196,6 +225,10 @@ impl WgPeerSession {
 
     pub fn build_probe(&self, kind: P2pProbeKind, ts_ms: u64) -> [u8; P2P_PROBE_LEN] {
         encode_p2p_probe(kind, &self.probe_token, ts_ms)
+    }
+
+    pub fn build_bench_payload(&self, tag: u64, total_len: usize) -> Vec<u8> {
+        encode_bench_payload(&self.probe_token, tag, total_len)
     }
 
     pub fn is_direct_udp_active(&self) -> bool {
@@ -217,6 +250,7 @@ impl WgPeerSession {
     }
 
     pub fn mark_direct_rx(&mut self, from: SocketAddr) {
+        self.confirmed = true;
         self.direct_endpoint = Some(from);
         self.last_direct_rx = Some(Instant::now());
         if !self.candidates.contains(&from) {
@@ -225,16 +259,27 @@ impl WgPeerSession {
     }
 
     pub fn mark_relay_rx(&mut self) {
+        self.confirmed = true;
         self.last_relay_rx = Some(Instant::now());
+    }
+
+    /// Zero-allocation hot-path encryption of an outbound IPv4 packet into caller-provided `dst` buffer.
+    pub fn encapsulate_ipv4_into<'a>(
+        &mut self,
+        ipv4_pkt: &[u8],
+        dst: &'a mut [u8],
+    ) -> Option<&'a [u8]> {
+        match self.tunn.encapsulate(ipv4_pkt, dst) {
+            TunnResult::WriteToNetwork(slice) => Some(slice),
+            _ => None,
+        }
     }
 
     /// Encrypts an outbound IPv4 packet into a WireGuard UDP datagram.
     pub fn encapsulate_ipv4(&mut self, ipv4_pkt: &[u8]) -> Option<Vec<u8>> {
         let mut dst = vec![0u8; ipv4_pkt.len() + 148];
-        match self.tunn.encapsulate(ipv4_pkt, &mut dst) {
-            TunnResult::WriteToNetwork(slice) => Some(slice.to_vec()),
-            _ => None,
-        }
+        self.encapsulate_ipv4_into(ipv4_pkt, &mut dst)
+            .map(|slice| slice.to_vec())
     }
 
     /// Initiates a WireGuard handshake packet proactively.
@@ -255,16 +300,26 @@ impl WgPeerSession {
         }
     }
 
-    /// Decapsulates an incoming WireGuard packet (received from either UDP or Binary WS).
-    pub fn decapsulate_wg(&mut self, src_ip: Option<IpAddr>, wg_pkt: &[u8]) -> DecapOutput {
+    /// Decapsulates an incoming WireGuard packet reusing caller-provided scratch buffer `dst`
+    /// to avoid per-packet heap allocations on the receive hot path.
+    pub fn decapsulate_wg_with_buf(
+        &mut self,
+        src_ip: Option<IpAddr>,
+        wg_pkt: &[u8],
+        dst: &mut Vec<u8>,
+    ) -> DecapOutput {
         let mut out = DecapOutput {
             tunnel_ipv4: None,
             network_replies: Vec::new(),
             authenticated: false,
         };
 
-        let mut dst = vec![0u8; wg_pkt.len().max(2048) + 148];
-        match self.tunn.decapsulate(src_ip, wg_pkt, &mut dst) {
+        let needed = wg_pkt.len().max(2048) + 148;
+        if dst.len() < needed {
+            dst.resize(needed, 0);
+        }
+
+        match self.tunn.decapsulate(src_ip, wg_pkt, dst.as_mut_slice()) {
             TunnResult::Done => {
                 // Valid keepalive or state update packet
                 out.authenticated = true;
@@ -279,8 +334,8 @@ impl WgPeerSession {
 
                 // Per boringtun docs: after WriteToNetwork, call decapsulate with empty slice
                 // until Done to flush any queued packets waiting on handshake completion.
+                let mut flush_buf = [0u8; 2048];
                 loop {
-                    let mut flush_buf = vec![0u8; 2048];
                     match self.tunn.decapsulate(None, &[], &mut flush_buf) {
                         TunnResult::WriteToNetwork(more) => {
                             out.network_replies.push(more.to_vec());
@@ -298,6 +353,12 @@ impl WgPeerSession {
         }
 
         out
+    }
+
+    /// Decapsulates an incoming WireGuard packet (received from either UDP or Binary WS).
+    pub fn decapsulate_wg(&mut self, src_ip: Option<IpAddr>, wg_pkt: &[u8]) -> DecapOutput {
+        let mut dst = vec![0u8; wg_pkt.len().max(2048) + 148];
+        self.decapsulate_wg_with_buf(src_ip, wg_pkt, &mut dst)
     }
 }
 
@@ -431,5 +492,90 @@ mod tests {
         // WireGuard packets and random garbage must NOT decode as P2P probes
         assert!(decode_p2p_probe(&[0x01, 0x00, 0x00, 0x00]).is_none());
         assert!(decode_p2p_probe(&[0x04; 27]).is_none());
+
+        // Security check: a third party (e.g. signaling server) knowing session_id + both public keys
+        // cannot derive the same DH-authenticated probe token!
+        let attacker_keys = WireGuardKeypair::generate();
+        let attacker_peer = WgPeerSession::new(
+            Ipv4Addr::new(10, 99, 0, 2),
+            "sess_tok_abcdef01".into(),
+            attacker_keys.secret_clone(),
+            client_pub,
+            3,
+            vec![],
+        );
+        assert!(!host.matches_probe_token(&attacker_peer.probe_token));
+
+        // Benchmark payload roundtrip check
+        let bench_pkt = client.build_bench_payload(999, 1200);
+        assert_eq!(bench_pkt.len(), 1200);
+        let (b_kind, b_tok, b_tag) = decode_p2p_probe(&bench_pkt).expect("valid bench payload");
+        assert_eq!(b_kind, P2pProbeKind::BenchPayload);
+        assert_eq!(b_tag, 999);
+        assert!(host.matches_probe_token(&b_tok));
+    }
+
+    #[test]
+    fn test_orphan_unconfirmed_peer_detection_and_hot_path_throughput_benchmark() {
+        let host_keys = WireGuardKeypair::generate();
+        let client_keys = WireGuardKeypair::generate();
+        let host_pub = host_keys.public_key();
+        let client_pub = client_keys.public_key();
+
+        let mut host = WgPeerSession::new(
+            Ipv4Addr::new(10, 99, 0, 2),
+            "sess_tok_bench".into(),
+            host_keys.secret_clone(),
+            client_pub,
+            1,
+            vec![],
+        );
+        assert!(host.is_stale_unconfirmed(Duration::from_secs(0)));
+        assert!(!host.is_stale_unconfirmed(Duration::from_secs(60)));
+        host.mark_confirmed();
+        assert!(!host.is_stale_unconfirmed(Duration::from_secs(0)));
+
+        let mut client = WgPeerSession::new(
+            Ipv4Addr::new(10, 99, 0, 1),
+            "sess_tok_bench".into(),
+            client_keys.secret_clone(),
+            host_pub,
+            2,
+            vec![],
+        );
+
+        // Complete WireGuard handshake
+        let mut ipv4_pkt = vec![0x55u8; 1340];
+        ipv4_pkt[0] = 0x45;
+        ipv4_pkt[2..4].copy_from_slice(&(1340u16).to_be_bytes());
+        ipv4_pkt[9] = 6;
+        ipv4_pkt[12..16].copy_from_slice(&[10, 99, 0, 2]);
+        ipv4_pkt[16..20].copy_from_slice(&[10, 99, 0, 1]);
+
+        let init = client.encapsulate_ipv4(&ipv4_pkt).unwrap();
+        let h_resp = host.decapsulate_wg(None, &init);
+        let c_done = client.decapsulate_wg(None, &h_resp.network_replies[0]);
+        for r in &c_done.network_replies {
+            let _ = host.decapsulate_wg(None, r);
+        }
+
+        // Micro-benchmark zero-alloc hot path (500 x 1340B packets encrypt + decrypt)
+        let mut enc_buf = vec![0u8; 2048];
+        let mut dec_buf = vec![0u8; 2048];
+        let start = Instant::now();
+        for _ in 0..500 {
+            let wire = client
+                .encapsulate_ipv4_into(&ipv4_pkt, &mut enc_buf)
+                .expect("encapsulate into");
+            let out = host.decapsulate_wg_with_buf(None, wire, &mut dec_buf);
+            assert!(out.authenticated);
+            assert_eq!(out.tunnel_ipv4.as_ref().map(|v| v.len()), Some(1340));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "Hot path crypto unexpectedly slow: {:?}",
+            elapsed
+        );
     }
 }
