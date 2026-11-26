@@ -526,6 +526,7 @@ impl ServiceEngine {
                     String,
                     (Option<String>, Option<String>, String, Option<String>),
                 >::new();
+                let mut vip_to_session = std::collections::HashMap::<String, String>::new();
 
                 while let Some(msg) = rx.recv().await {
                     match msg {
@@ -558,52 +559,55 @@ impl ServiceEngine {
                             }
 
                             let mut clients = host_clients_for_pump.lock().await;
+                            // If a reconnecting client already evicted its old session or if stale sessions accumulated,
+                            // ensure we don't lock out an authenticated client due to ghost sessions.
                             if clients.len() as u32 >= allowed_nodes
                                 && !clients.contains(&session_id)
                             {
-                                let _ = tx.send(SignalingMessage::Error {
-                                    code: "PEER_LIMIT_EXCEEDED".into(),
-                                    message: format!(
-                                        "Host connection limit reached ({}/{} branch nodes connected).",
-                                        clients.len(),
-                                        allowed_nodes
-                                    ),
-                                });
-                            } else {
-                                clients.insert(session_id.clone());
-                                *active_session.lock().await = Some(session_id.clone());
+                                if let Some(stale_sid) = clients.iter().next().cloned() {
+                                    clients.remove(&stale_sid);
+                                }
+                            }
+                            clients.insert(session_id.clone());
+                            *active_session.lock().await = Some(session_id.clone());
 
-                                // Register WireGuard (boringtun) P2P peer if client provided WG pubkey + VIP
-                                if let Some(ref tok) = matched_token {
-                                    if let Some((
-                                        Some(client_wg_pub),
-                                        Some(client_vip_str),
-                                        client_pub_ep,
-                                        client_local_ep,
-                                    )) = pending_wg_peers.remove(tok)
+                            // Register WireGuard (boringtun) P2P peer if client provided WG pubkey + VIP
+                            if let Some(ref tok) = matched_token {
+                                if let Some((
+                                    Some(client_wg_pub),
+                                    Some(client_vip_str),
+                                    client_pub_ep,
+                                    client_local_ep,
+                                )) = pending_wg_peers.remove(tok)
+                                {
+                                    if let Some(old_sid) =
+                                        vip_to_session.insert(client_vip_str.clone(), session_id.clone())
                                     {
-                                        if let Ok(client_vip) =
-                                            client_vip_str.parse::<std::net::Ipv4Addr>()
-                                        {
-                                            let candidates = t3_adapters::parse_endpoint_candidates(
-                                                &client_pub_ep,
-                                                client_local_ep.as_deref(),
-                                            );
-                                            let _ = tunnel_for_host
-                                                .register_wg_peer(
-                                                    client_vip,
-                                                    session_id.clone(),
-                                                    &client_wg_pub,
-                                                    candidates,
-                                                    false,
-                                                )
-                                                .await;
+                                        if old_sid != session_id {
+                                            clients.remove(&old_sid);
                                         }
                                     }
+                                    if let Ok(client_vip) =
+                                        client_vip_str.parse::<std::net::Ipv4Addr>()
+                                    {
+                                        let candidates = t3_adapters::parse_endpoint_candidates(
+                                            &client_pub_ep,
+                                            client_local_ep.as_deref(),
+                                        );
+                                        let _ = tunnel_for_host
+                                            .register_wg_peer(
+                                                client_vip,
+                                                session_id.clone(),
+                                                &client_wg_pub,
+                                                candidates,
+                                                false,
+                                            )
+                                            .await;
+                                    }
                                 }
-
-                                let _ = tx.send(SignalingMessage::RelayAccepted { session_id });
                             }
+
+                            let _ = tx.send(SignalingMessage::RelayAccepted { session_id });
                         }
                         SignalingMessage::HolePunchOffer {
                             target_peer_id: _,
@@ -640,6 +644,7 @@ impl ServiceEngine {
                             let token: String = (0..8)
                                 .map(|_| format!("{:02x}", rand::random::<u8>()))
                                 .collect();
+                            let pre_session_id = format!("sess_tok_{}", token);
                             authorized_tokens.insert(token.clone());
                             pending_wg_peers.insert(
                                 token.clone(),
@@ -651,35 +656,39 @@ impl ServiceEngine {
                                 ),
                             );
 
+                            // Clean up any previous stale session from the same client virtual IP
+                            if let Some(ref client_vip_str) = parsed_offer.virtual_ip {
+                                if let Some(old_sid) = vip_to_session
+                                    .insert(client_vip_str.clone(), pre_session_id.clone())
+                                {
+                                    host_clients_for_pump.lock().await.remove(&old_sid);
+                                }
+                            }
+
                             // Refresh STUN endpoint & immediately pre-register WireGuard peer + punch Host NAT
                             // BEFORE HolePunchAnswer reaches Client (eliminates 700ms RelayRequest race condition!)
                             let (fresh_public_ep, fresh_local_cand) =
                                 tunnel_for_host.refresh_p2p_endpoints().await;
 
-                            let can_accept =
-                                (host_clients_for_pump.lock().await.len() as u32) < allowed_nodes;
-                            if can_accept {
-                                if let (Some(client_wg_pub), Some(client_vip_str)) =
-                                    (&parsed_offer.wg_pubkey, &parsed_offer.virtual_ip)
+                            if let (Some(client_wg_pub), Some(client_vip_str)) =
+                                (&parsed_offer.wg_pubkey, &parsed_offer.virtual_ip)
+                            {
+                                if let Ok(client_vip) =
+                                    client_vip_str.parse::<std::net::Ipv4Addr>()
                                 {
-                                    if let Ok(client_vip) =
-                                        client_vip_str.parse::<std::net::Ipv4Addr>()
-                                    {
-                                        let candidates = t3_adapters::parse_endpoint_candidates(
-                                            &offer.public_endpoint,
-                                            offer.local_candidate.as_deref(),
-                                        );
-                                        let pre_session_id = format!("sess_tok_{}", token);
-                                        let _ = tunnel_for_host
-                                            .register_wg_peer(
-                                                client_vip,
-                                                pre_session_id,
-                                                client_wg_pub,
-                                                candidates,
-                                                false,
-                                            )
-                                            .await;
-                                    }
+                                    let candidates = t3_adapters::parse_endpoint_candidates(
+                                        &offer.public_endpoint,
+                                        offer.local_candidate.as_deref(),
+                                    );
+                                    let _ = tunnel_for_host
+                                        .register_wg_peer(
+                                            client_vip,
+                                            pre_session_id,
+                                            client_wg_pub,
+                                            candidates,
+                                            false,
+                                        )
+                                        .await;
                                 }
                             }
 

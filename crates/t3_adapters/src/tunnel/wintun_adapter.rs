@@ -39,6 +39,8 @@ const UDP_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const UDP_SOCKET_BUFFER_FALLBACK_BYTES: usize = 1024 * 1024;
 
 const STUN_SERVERS: &[&str] = &[
+    "74.125.250.129:19302",
+    "162.159.207.0:3478",
     "stun.l.google.com:19302",
     "stun.cloudflare.com:3478",
     "stun1.l.google.com:19302",
@@ -50,6 +52,43 @@ const STUN_V6_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
     "stun.cloudflare.com:3478",
 ];
+
+/// Resolves a STUN server string (`host:port` or `ipv4:port`) specifically to an IPv4 `SocketAddr`.
+/// Critical on dual-stack Windows machines (e.g. Reliance Jio / Airtel with IPv6 enabled) where
+/// `tokio::net::lookup_host("stun.l.google.com:19302")` returns the IPv6 `AAAA` record first, causing
+/// `UdpSocket::send_to` on an IPv4 socket to fail with `WSAEAFNOSUPPORT`!
+async fn resolve_stun_ipv4(server: &str) -> Option<SocketAddr> {
+    if let Ok(sa) = server.parse::<SocketAddr>() {
+        if sa.is_ipv4() {
+            return Some(sa);
+        }
+    }
+    let addrs = tokio::net::lookup_host(server).await.ok()?;
+    for sa in addrs {
+        if sa.is_ipv4() {
+            return Some(sa);
+        }
+    }
+    None
+}
+
+/// Resolves a STUN server string specifically to an IPv6 `SocketAddr`.
+async fn resolve_stun_ipv6(server: &str) -> Option<SocketAddr> {
+    if let Ok(mut sa) = server.parse::<SocketAddr>() {
+        if let SocketAddr::V6(ref mut v6) = sa {
+            v6.set_scope_id(0);
+            return Some(sa);
+        }
+    }
+    let addrs = tokio::net::lookup_host(server).await.ok()?;
+    for mut sa in addrs {
+        if let SocketAddr::V6(ref mut v6) = sa {
+            v6.set_scope_id(0);
+            return Some(sa);
+        }
+    }
+    None
+}
 
 /// Disables Windows `SIO_UDP_CONNRESET` (0x9800000C) on an unconnected UDP socket so ICMP
 /// Port Unreachable replies from NAT hole-punch probes never poison the socket state.
@@ -155,6 +194,7 @@ fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
 }
 
 type PeerMap = HashMap<Ipv4Addr, Arc<std::sync::Mutex<WgPeerSession>>>;
+type EarlyProbeEntry = (SocketAddr, [u8; 16], u64, std::time::Instant);
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -194,6 +234,7 @@ pub struct WintunTunnelAdapter {
     wg_keypair: Arc<WireGuardKeypair>,
     wg_peers: Arc<std::sync::RwLock<PeerMap>>,
     session_to_vip: Arc<std::sync::RwLock<HashMap<String, Ipv4Addr>>>,
+    early_udp_probes: Arc<std::sync::Mutex<Vec<EarlyProbeEntry>>>,
     p2p_gen: Arc<AtomicU64>,
     peer_index_seq: AtomicU32,
 }
@@ -219,6 +260,7 @@ impl WintunTunnelAdapter {
             wg_keypair: Arc::new(WireGuardKeypair::generate()),
             wg_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             session_to_vip: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            early_udp_probes: Arc::new(std::sync::Mutex::new(Vec::new())),
             p2p_gen: Arc::new(AtomicU64::new(0)),
             peer_index_seq: AtomicU32::new(1),
         }
@@ -265,9 +307,13 @@ impl WintunTunnelAdapter {
                 *g = Some(tx_id);
             }
             let req = StunClientAdapter::build_binding_request(&tx_id);
-            let _ = sock.send_to(&req, STUN_SERVERS[0]).await;
-            let _ = sock.send_to(&req, STUN_SERVERS[1]).await;
-            tokio::time::sleep(Duration::from_millis(180)).await;
+            if let Some(sa0) = resolve_stun_ipv4(STUN_SERVERS[0]).await {
+                let _ = sock.send_to(&req, sa0).await;
+            }
+            if let Some(sa1) = resolve_stun_ipv4(STUN_SERVERS[1]).await {
+                let _ = sock.send_to(&req, sa1).await;
+            }
+            tokio::time::sleep(Duration::from_millis(160)).await;
         }
 
         self.current_p2p_endpoints()
@@ -347,20 +393,26 @@ impl WintunTunnelAdapter {
         });
 
         // Discover public reflexive IPv4 endpoint using the EXACT same IPv4 UDP socket
+        // (Must resolve specifically to IPv4 so dual-stack PCs where DNS returns AAAA first do not fail!)
         let mut public_endpoint = "0.0.0.0:0".to_string();
         for server in STUN_SERVERS {
+            let Some(stun_v4_addr) = resolve_stun_ipv4(server).await else {
+                continue;
+            };
             let mut tx_id = [0u8; 12];
             rand::thread_rng().fill_bytes(&mut tx_id);
             let req = StunClientAdapter::build_binding_request(&tx_id);
-            if sock.send_to(&req, server).await.is_ok() {
+            if sock.send_to(&req, stun_v4_addr).await.is_ok() {
                 let mut buf = [0u8; 512];
                 if let Ok(Ok((len, _))) =
                     timeout(Duration::from_millis(1200), sock.recv_from(&mut buf)).await
                 {
                     if let Ok(addr) = StunClientAdapter::parse_binding_response(&buf[..len], &tx_id)
                     {
-                        public_endpoint = addr.to_string();
-                        break;
+                        if addr.is_ipv4() {
+                            public_endpoint = addr.to_string();
+                            break;
+                        }
                     }
                 }
             }
@@ -370,10 +422,13 @@ impl WintunTunnelAdapter {
         let mut stun_v6_endpoint: Option<SocketAddr> = None;
         if let Some(ref s6) = sock_v6 {
             for server in STUN_V6_SERVERS {
+                let Some(stun_v6_addr) = resolve_stun_ipv6(server).await else {
+                    continue;
+                };
                 let mut tx_id = [0u8; 12];
                 rand::thread_rng().fill_bytes(&mut tx_id);
                 let req = StunClientAdapter::build_binding_request(&tx_id);
-                if s6.send_to(&req, server).await.is_ok() {
+                if s6.send_to(&req, stun_v6_addr).await.is_ok() {
                     let mut buf = [0u8; 512];
                     if let Ok(Ok((len, _))) =
                         timeout(Duration::from_millis(900), s6.recv_from(&mut buf)).await
@@ -406,11 +461,15 @@ impl WintunTunnelAdapter {
         if let Ok(mut guard) = self.p2p_udp_v6_socket.write() {
             *guard = sock_v6.clone();
         }
+        if let Ok(mut guard) = self.early_udp_probes.lock() {
+            guard.clear();
+        }
 
         // 1a. Spawn IPv4 UDP Inbound Receiver Task
         spawn_udp_receiver_task(
             Arc::clone(&sock),
             Arc::clone(&self.wg_peers),
+            Arc::clone(&self.early_udp_probes),
             Arc::clone(&self.session),
             Arc::clone(&self.bytes_received),
             Arc::clone(&self.latency_ms),
@@ -426,6 +485,7 @@ impl WintunTunnelAdapter {
             spawn_udp_receiver_task(
                 Arc::clone(s6),
                 Arc::clone(&self.wg_peers),
+                Arc::clone(&self.early_udp_probes),
                 Arc::clone(&self.session),
                 Arc::clone(&self.bytes_received),
                 Arc::clone(&self.latency_ms),
@@ -462,9 +522,13 @@ impl WintunTunnelAdapter {
                     }
                     let req = StunClientAdapter::build_binding_request(&tx_id);
                     let srv_idx = ((tick_count / 40) as usize) % STUN_SERVERS.len();
-                    let _ = sock_timer.send_to(&req, STUN_SERVERS[srv_idx]).await;
+                    if let Some(v4_stun) = resolve_stun_ipv4(STUN_SERVERS[srv_idx]).await {
+                        let _ = sock_timer.send_to(&req, v4_stun).await;
+                    }
                     if let Some(ref s6) = sock_v6_timer {
-                        let _ = s6.send_to(&req, STUN_V6_SERVERS[0]).await;
+                        if let Some(v6_stun) = resolve_stun_ipv6(STUN_V6_SERVERS[0]).await {
+                            let _ = s6.send_to(&req, v6_stun).await;
+                        }
                     }
                 }
 
@@ -672,12 +736,36 @@ impl WintunTunnelAdapter {
         let udp_ping = peer.build_probe(P2pProbeKind::UdpPing, now_ms);
         let relay_ping = peer.build_probe(P2pProbeKind::RelayPing, now_ms);
 
+        // Check if an early UDP P2P_PING from the remote peer already arrived before HolePunchAnswer!
+        let mut early_pongs: Vec<(SocketAddr, [u8; 27])> = Vec::new();
+        if let Ok(mut early_list) = self.early_udp_probes.lock() {
+            early_list.retain(|(_, _, _, t)| t.elapsed() < Duration::from_secs(5));
+            for (early_src, early_tok, early_ts, _) in early_list.iter() {
+                if peer.matches_probe_token(early_tok) {
+                    peer.mark_direct_rx(*early_src);
+                    early_pongs.push((*early_src, peer.build_probe(P2pProbeKind::UdpPong, *early_ts)));
+                }
+            }
+        }
+
         let peer_arc = Arc::new(std::sync::Mutex::new(peer));
         if let Ok(mut map) = self.wg_peers.write() {
             map.insert(virtual_ip, peer_arc);
         }
         if let Ok(mut s2v) = self.session_to_vip.write() {
+            // Purge any stale session_ids that previously mapped to this same virtual_ip
+            s2v.retain(|_, v| *v != virtual_ip);
             s2v.insert(session_id.clone(), virtual_ip);
+        }
+
+        if !early_pongs.is_empty() {
+            let maybe_sock = self.p2p_udp_socket.read().ok().and_then(|g| g.clone());
+            let maybe_sock_v6 = self.p2p_udp_v6_socket.read().ok().and_then(|g| g.clone());
+            if let Some(sock) = maybe_sock {
+                for (dst, pong) in &early_pongs {
+                    send_p2p_datagram(&sock, maybe_sock_v6.as_deref(), pong, *dst).await;
+                }
+            }
         }
 
         // UDP-First: fire authenticated UDP P2P_PING burst to all candidates + CGNAT port-spray window immediately
@@ -693,7 +781,7 @@ impl WintunTunnelAdapter {
         Ok(())
     }
 
-    /// Removes a WireGuard peer when its session closes.
+    /// Removes a WireGuard peer when its session closes (ignores stale RelayClose from superseded sessions).
     pub fn remove_wg_peer_by_session(&self, session_id: &str) {
         let maybe_vip = self
             .session_to_vip
@@ -702,7 +790,13 @@ impl WintunTunnelAdapter {
             .and_then(|mut m| m.remove(session_id));
         if let Some(vip) = maybe_vip {
             if let Ok(mut peers) = self.wg_peers.write() {
-                peers.remove(&vip);
+                let should_remove = peers
+                    .get(&vip)
+                    .and_then(|mtx| mtx.lock().ok().map(|p| p.session_id == session_id))
+                    .unwrap_or(false);
+                if should_remove {
+                    peers.remove(&vip);
+                }
             }
         }
     }
@@ -836,6 +930,7 @@ impl WintunTunnelAdapter {
 fn spawn_udp_receiver_task(
     sock_rx: Arc<UdpSocket>,
     peers_rx: Arc<std::sync::RwLock<PeerMap>>,
+    early_probes_rx: Arc<std::sync::Mutex<Vec<EarlyProbeEntry>>>,
     session_rx: Arc<std::sync::RwLock<Option<Arc<wintun::Session>>>>,
     bytes_rx: Arc<AtomicU64>,
     latency_rx: Arc<AtomicU32>,
@@ -895,10 +990,12 @@ fn spawn_udp_receiver_task(
             //     (Bypasses boringtun anti-replay counters so Direct UDP promotes reliably!)
             if let Some((probe_kind, probe_token, ts_ms)) = decode_p2p_probe(packet) {
                 if matches!(probe_kind, P2pProbeKind::UdpPing | P2pProbeKind::UdpPong) {
+                    let mut matched_any = false;
                     for peer_mtx in peer_list {
                         let reply_opt = match peer_mtx.lock() {
                             Ok(mut peer) => {
                                 if peer.matches_probe_token(&probe_token) {
+                                    matched_any = true;
                                     peer.mark_direct_rx(src);
                                     if probe_kind == P2pProbeKind::UdpPing {
                                         Some(peer.build_probe(P2pProbeKind::UdpPong, ts_ms))
@@ -921,6 +1018,17 @@ fn spawn_udp_receiver_task(
                             let _ = sock_rx.send_to(&pong, src).await;
                         }
                         break;
+                    }
+
+                    // If Host's UdpPing arrived over direct UDP before HolePunchAnswer arrived over Cloud WebSocket,
+                    // cache it so `register_wg_peer` can promote & reply immediately when HolePunchAnswer arrives!
+                    if !matched_any && probe_kind == P2pProbeKind::UdpPing {
+                        if let Ok(mut early) = early_probes_rx.lock() {
+                            early.retain(|(_, _, _, t)| t.elapsed() < Duration::from_secs(5));
+                            if early.len() < 16 {
+                                early.push((src, probe_token, ts_ms, std::time::Instant::now()));
+                            }
+                        }
                     }
                 }
                 continue;
@@ -1522,6 +1630,9 @@ impl TunnelPort for WintunTunnelAdapter {
         if let Ok(mut guard) = self.session_to_vip.write() {
             guard.clear();
         }
+        if let Ok(mut guard) = self.early_udp_probes.lock() {
+            guard.clear();
+        }
         if let Ok(mut guard) = self.outbound_tx.write() {
             *guard = None;
         }
@@ -1609,6 +1720,50 @@ mod tests {
         assert!(sprayed.contains(&"152.58.163.162:49632".parse().unwrap()));
         // Private LAN IP 10.17.120.176 should NOT be port-sprayed
         assert!(!sprayed.contains(&"10.17.120.176:49634".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_stun_ipv4_returns_ipv4_socket_addr() {
+        let addr = resolve_stun_ipv4("74.125.250.129:19302")
+            .await
+            .expect("should parse direct IPv4 literal");
+        assert!(addr.is_ipv4());
+        assert_eq!(addr.port(), 19302);
+    }
+
+    #[tokio::test]
+    async fn test_stale_remove_wg_peer_does_not_evict_reconnected_session() {
+        let host = WintunTunnelAdapter::new();
+        let client = WintunTunnelAdapter::new();
+        let vip = Ipv4Addr::new(10, 99, 0, 2);
+
+        host.register_wg_peer(
+            vip,
+            "sess_tok_old".into(),
+            &client.local_wg_pubkey_b64(),
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+
+        host.register_wg_peer(
+            vip,
+            "sess_tok_new".into(),
+            &client.local_wg_pubkey_b64(),
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Delayed RelayClose for the old session must NOT remove the new session!
+        host.remove_wg_peer_by_session("sess_tok_old");
+        assert!(host.wg_peers.read().unwrap().contains_key(&vip));
+
+        // RelayClose for the active session DOES remove it
+        host.remove_wg_peer_by_session("sess_tok_new");
+        assert!(!host.wg_peers.read().unwrap().contains_key(&vip));
     }
 
     #[tokio::test]
