@@ -33,10 +33,11 @@ pub(crate) struct RegistryDwordEntry {
 ///
 /// - `DisableBandwidthThrottling = 1`: disables Windows SMB WAN throughput throttling.
 /// - `DisableLargeMtu = 0`: enables SMB 2/3 Large MTU (up to 1 MB multi-credit reads/writes).
-/// - Raised metadata cache capacities (`FileInfoCacheEntriesMax`, `DirectoryCacheEntriesMax`,
-///   `FileNotFoundCacheEntriesMax`) & lifetimes reduce repetitive SMB round-trips when legacy
-///   file-based ERPs (Marg/FoxPro/VB `.dbf`/`.cdx`) probe hundreds of files on startup.
-/// - `MaxCmds = 2048`: raises concurrent in-flight SMB requests over WAN links.
+/// - Raised metadata cache capacities (`FileInfoCacheEntriesMax = 4096`, `DirectoryCacheEntriesMax = 512`,
+///   `FileNotFoundCacheEntriesMax = 2048`) & 60s lifetimes reduce repetitive SMB round-trips across
+///   the full 30-45s startup window when legacy file-based ERPs (`.dbf`/`.cdx`/`.dll`) probe files.
+/// - `MaxCmds = 512`: raises concurrent in-flight SMB requests over WAN links while staying safe
+///   for Windows kernel non-paged/paged pool limits (`rdbss.sys`) on 4 GB RAM client PCs.
 pub(crate) fn smb_client_wan_tuning_entries() -> &'static [RegistryDwordEntry] {
     &[
         RegistryDwordEntry {
@@ -62,37 +63,37 @@ pub(crate) fn smb_client_wan_tuning_entries() -> &'static [RegistryDwordEntry] {
         RegistryDwordEntry {
             key: LANMAN_WORKSTATION_PARAMS_KEY,
             value_name: "FileInfoCacheEntriesMax",
-            data: 1024,
+            data: 4096,
         },
         RegistryDwordEntry {
             key: LANMAN_WORKSTATION_PARAMS_KEY,
             value_name: "DirectoryCacheEntriesMax",
-            data: 128,
-        },
-        RegistryDwordEntry {
-            key: LANMAN_WORKSTATION_PARAMS_KEY,
-            value_name: "FileNotFoundCacheEntriesMax",
             data: 512,
         },
         RegistryDwordEntry {
             key: LANMAN_WORKSTATION_PARAMS_KEY,
+            value_name: "FileNotFoundCacheEntriesMax",
+            data: 2048,
+        },
+        RegistryDwordEntry {
+            key: LANMAN_WORKSTATION_PARAMS_KEY,
             value_name: "FileInfoCacheLifetime",
-            data: 10,
+            data: 60,
         },
         RegistryDwordEntry {
             key: LANMAN_WORKSTATION_PARAMS_KEY,
             value_name: "DirectoryCacheLifetime",
-            data: 10,
+            data: 60,
         },
         RegistryDwordEntry {
             key: LANMAN_WORKSTATION_PARAMS_KEY,
             value_name: "FileNotFoundCacheLifetime",
-            data: 10,
+            data: 60,
         },
         RegistryDwordEntry {
             key: LANMAN_WORKSTATION_PARAMS_KEY,
             value_name: "MaxCmds",
-            data: 2048,
+            data: 512,
         },
         // Keep open Marg/Tally DBF handles alive across brief 4G/5G handoffs (prevents "Delayed Write Failed")
         RegistryDwordEntry {
@@ -397,6 +398,15 @@ impl Default for WindowsSystemAdapter {
     }
 }
 
+/// Normalizes a UNC path by trimming surrounding whitespace and any trailing slashes
+/// (e.g. `\\10.99.0.1\MARGERP\` -> `\\10.99.0.1\MARGERP`).
+fn normalize_unc_path(unc_path: &str) -> String {
+    unc_path
+        .trim()
+        .trim_end_matches(&['\\', '/'][..])
+        .to_string()
+}
+
 /// Extracts the host component from a UNC path like `\\10.99.0.1\MARGERP` -> `Some("10.99.0.1")`.
 fn extract_unc_host(unc_path: &str) -> Option<&str> {
     let trimmed = unc_path.trim().strip_prefix(r"\\")?;
@@ -412,6 +422,8 @@ fn extract_unc_host(unc_path: &str) -> Option<&str> {
 impl WindowsSystemPort for WindowsSystemAdapter {
     async fn mount_drive(&self, letter: char, unc_path: &str) -> DomainResult<()> {
         let drive_spec = format!("{}:", letter.to_ascii_uppercase());
+        let normalized_unc = normalize_unc_path(unc_path);
+        let unc_path = normalized_unc.as_str();
 
         // 1. Apply SMB Client WAN & DBF/ERP Registry Tuning + LinkedConnections (one-shot per process)
         //    and clear any existing stale mapping on this drive letter in a blocking worker thread.
@@ -737,10 +749,13 @@ The command completed successfully.
 
         assert_eq!(find("DisableBandwidthThrottling"), Some(1));
         assert_eq!(find("DisableLargeMtu"), Some(0));
-        assert_eq!(find("FileInfoCacheEntriesMax"), Some(1024));
-        assert_eq!(find("DirectoryCacheEntriesMax"), Some(128));
-        assert_eq!(find("FileNotFoundCacheEntriesMax"), Some(512));
-        assert_eq!(find("MaxCmds"), Some(2048));
+        assert_eq!(find("FileInfoCacheEntriesMax"), Some(4096));
+        assert_eq!(find("DirectoryCacheEntriesMax"), Some(512));
+        assert_eq!(find("FileNotFoundCacheEntriesMax"), Some(2048));
+        assert_eq!(find("FileInfoCacheLifetime"), Some(60));
+        assert_eq!(find("DirectoryCacheLifetime"), Some(60));
+        assert_eq!(find("FileNotFoundCacheLifetime"), Some(60));
+        assert_eq!(find("MaxCmds"), Some(512));
         assert_eq!(find("SessTimeout"), Some(120));
         assert_eq!(find("ExtendedSessTimeout"), Some(1000));
         assert_eq!(find("RequireSecuritySignature"), Some(0));
@@ -774,5 +789,21 @@ The command completed successfully.
         assert_eq!(extract_unc_host(r"\\10.99.0.1\MARGERP"), Some("10.99.0.1"));
         assert_eq!(extract_unc_host(r"\\SERVER-PC\SharedData"), Some("SERVER-PC"));
         assert_eq!(extract_unc_host("C:\\local"), None);
+    }
+
+    #[test]
+    fn test_normalize_unc_path() {
+        assert_eq!(
+            normalize_unc_path(r"\\10.99.0.1\MARGERP\"),
+            r"\\10.99.0.1\MARGERP"
+        );
+        assert_eq!(
+            normalize_unc_path(r"  \\10.99.0.1\F///  "),
+            r"\\10.99.0.1\F"
+        );
+        assert_eq!(
+            normalize_unc_path(r"\\10.99.0.1\SharedData"),
+            r"\\10.99.0.1\SharedData"
+        );
     }
 }

@@ -1809,7 +1809,8 @@ pub async fn get_session_status(state: tauri::State<'_, AppState>) -> Result<UiS
                     } else if let (Some(ip), Some(sh)) =
                         (&snap.client.server_ip, &snap.client.desired_share_name)
                     {
-                        format!(r"\\{}\{}\ -> {}:", ip, sh, d)
+                        let clean_sh = sh.trim().trim_matches(&['\\', '/'][..]);
+                        format!(r"\\{}\{} -> {}:", ip, clean_sh, d)
                     } else {
                         format!(r"\\10.99.0.1\SharedData -> {}:", d)
                     }
@@ -1914,17 +1915,24 @@ pub async fn open_folder(
     drive_letter: Option<char>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let drive = drive_letter
-        .or(*state.active_drive.lock().await)
-        .unwrap_or('Z');
+    let mut drive = drive_letter.or(*state.active_drive.lock().await);
     let unc = state.active_unc.lock().await.clone();
 
+    if drive.is_none() {
+        if let Ok(IpcResponse::Status(snap)) = send_ipc_request(&IpcRequest::GetStatus).await {
+            drive = snap.client.desired_drive_letter;
+        }
+    }
+
+    let drive = drive.unwrap_or('Z').to_ascii_uppercase();
     let path_to_open = format!(r"{}:\", drive);
 
+    // Always prefer opening the mapped drive letter (e.g. Z:\) so FoxPro/Marg ERPs
+    // never launch from a raw UNC path; only fall back to UNC if the drive letter is absent.
     let target = if std::path::Path::new(&path_to_open).exists() {
         path_to_open
     } else if let Some(unc_path) = unc {
-        unc_path
+        unc_path.trim().trim_end_matches(&['\\', '/'][..]).to_string()
     } else {
         path_to_open
     };

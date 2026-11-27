@@ -7,19 +7,121 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
-/// Checks asynchronously (with a 1500ms timeout) whether a mapped Windows drive letter
-/// is actually readable and not stuck in a stale/disconnected ("Red X") SMB state.
+/// Consecutive failed drive-health probes required before triggering an automatic remount.
+/// Prevents a single brief WAN/SMB latency spike during heavy ERP DBF/DLL I/O from running
+/// `net use Z: /delete /y` under an active Marg/Tally process (which causes VFP9 C0000006 crashes).
+const PROBE_FAILURES_BEFORE_REMOUNT: u8 = 3;
+const DRIVE_ACCESS_PROBE_TIMEOUT_MS: u64 = 5000;
+
+/// Pure state tracker for safe SMB drive accessibility probing.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct DriveProbeTracker {
+    consecutive_failures: u8,
+}
+
+impl DriveProbeTracker {
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    /// Records the result of one drive accessibility probe and returns `true` only when
+    /// enough consecutive failures have occurred to justify tearing down & remounting the drive.
+    fn record_probe(&mut self, accessible: bool) -> bool {
+        if accessible {
+            self.consecutive_failures = 0;
+            false
+        } else {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.consecutive_failures >= PROBE_FAILURES_BEFORE_REMOUNT
+        }
+    }
+}
+
+/// Checks if `AppState` already recorded an active mount matching `(letter, desired_unc)`
+/// (for example right after the user clicks "Map Folder" in the UI), so the tray watchdog
+/// adopts the live mapping instead of redundantly running `net use /delete` 2.5s later.
+fn should_adopt_existing_mount(
+    app_active_drive: Option<char>,
+    app_active_unc: Option<&str>,
+    desired_letter: char,
+    desired_unc: &str,
+) -> bool {
+    app_active_drive.map(|d| d.to_ascii_uppercase()) == Some(desired_letter.to_ascii_uppercase())
+        && app_active_unc
+            .map(|u| u.trim().trim_end_matches(&['\\', '/'][..]))
+            .map(|u| u.eq_ignore_ascii_case(desired_unc.trim().trim_end_matches(&['\\', '/'][..])))
+            .unwrap_or(false)
+}
+
+/// Checks asynchronously (with a 5000ms timeout) whether a mapped Windows drive letter
+/// is actually reachable and not stuck in a stale/disconnected ("Red X") SMB state.
+/// Uses lightweight `std::fs::metadata` instead of `read_dir` to avoid enumerating
+/// large ERP share roots over WAN/SMB.
 async fn is_drive_accessible(letter: char) -> bool {
     let root = format!(r"{}:\", letter.to_ascii_uppercase());
     match tokio::time::timeout(
-        tokio::time::Duration::from_millis(1500),
-        tokio::task::spawn_blocking(move || std::fs::read_dir(&root).is_ok()),
+        tokio::time::Duration::from_millis(DRIVE_ACCESS_PROBE_TIMEOUT_MS),
+        tokio::task::spawn_blocking(move || std::fs::metadata(&root).is_ok()),
     )
     .await
     {
         Ok(Ok(ok)) => ok,
         _ => false,
     }
+}
+
+/// Non-destructively checks via `net use <letter>:` whether Windows already maps `letter`
+/// to `desired_unc` with status `OK`. Prevents tray restarts from tearing down an active
+/// ERP drive mapping that is already healthy.
+#[cfg(windows)]
+async fn is_windows_drive_already_mapped(letter: char, desired_unc: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let drive_spec = format!("{}:", letter.to_ascii_uppercase());
+    let target_unc = desired_unc.trim().trim_end_matches(&['\\', '/'][..]).to_string();
+
+    match tokio::time::timeout(
+        tokio::time::Duration::from_millis(3000),
+        tokio::task::spawn_blocking(move || {
+            let mut cmd = std::process::Command::new("net");
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.stdin(std::process::Stdio::null());
+            let Ok(out) = cmd.args(["use", &drive_spec]).output() else {
+                return false;
+            };
+            if !out.status.success() {
+                return false;
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut matches_remote = false;
+            let mut status_ok = false;
+            for line in stdout.lines() {
+                let lower = line.to_ascii_lowercase();
+                if lower.contains("remote name") {
+                    if let Some(val) = line.split("Remote name").nth(1).or_else(|| line.split_whitespace().last()) {
+                        let clean = val.trim().trim_end_matches(&['\\', '/'][..]);
+                        if clean.eq_ignore_ascii_case(&target_unc) {
+                            matches_remote = true;
+                        }
+                    }
+                } else if lower.contains("status") && lower.contains("ok") {
+                    status_ok = true;
+                }
+            }
+            matches_remote && status_ok
+        }),
+    )
+    .await
+    {
+        Ok(Ok(ok)) => ok,
+        _ => false,
+    }
+}
+
+#[cfg(not(windows))]
+async fn is_windows_drive_already_mapped(_letter: char, _desired_unc: &str) -> bool {
+    false
 }
 
 pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
@@ -111,6 +213,7 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         let mut last_seen_reconnect_event: Option<String> = None;
         let mut needs_remount = false;
         let mut accessibility_tick: u32 = 0;
+        let mut probe_tracker = DriveProbeTracker::default();
 
         loop {
             let snap_opt = match send_ipc_request(&IpcRequest::GetStatus).await {
@@ -184,16 +287,49 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                             let clean_share = share.trim().trim_matches('\\').trim_matches('/');
                             if !clean_share.is_empty() {
                                 let desired_unc = format!(r"\\{}\{}", server_ip, clean_share);
+
+                                // Sync from AppState if the UI already mounted this exact drive/UNC,
+                                // or adopt an already-healthy Windows mapping (e.g. after tray restart)
+                                // so we NEVER run `net use Z: /delete /y` under an open Marg/Tally session!
+                                if !needs_remount {
+                                    let already_tracked = mounted_unc_in_session
+                                        .as_ref()
+                                        .map(|(l, u)| *l == letter && u.eq_ignore_ascii_case(&desired_unc))
+                                        .unwrap_or(false);
+                                    if !already_tracked {
+                                        let app_drive = *state.active_drive.lock().await;
+                                        let app_unc = state.active_unc.lock().await.clone();
+                                        let adopted = should_adopt_existing_mount(
+                                            app_drive,
+                                            app_unc.as_deref(),
+                                            letter,
+                                            &desired_unc,
+                                        ) || is_windows_drive_already_mapped(letter, &desired_unc)
+                                            .await;
+
+                                        if adopted && is_drive_accessible(letter).await {
+                                            mounted_unc_in_session = Some((letter, desired_unc.clone()));
+                                            *state.active_drive.lock().await = Some(letter);
+                                            *state.active_unc.lock().await = Some(desired_unc.clone());
+                                            *state.is_connected.lock().await = true;
+                                            probe_tracker.reset();
+                                        }
+                                    }
+                                }
+
                                 let matches_session = mounted_unc_in_session
                                     .as_ref()
-                                    .map(|(l, u)| *l == letter && u == &desired_unc)
+                                    .map(|(l, u)| *l == letter && u.eq_ignore_ascii_case(&desired_unc))
                                     .unwrap_or(false)
                                     && state.system.is_drive_in_use(letter).await.unwrap_or(false);
 
-                                // Every ~15s (6 polls), probe actual SMB drive readability to catch stale Red-X handles
+                                // Every ~15s (6 polls), run a lightweight metadata probe.
+                                // Require 3 consecutive failures (~45s) before remounting so brief
+                                // WAN/DBF I/O spikes never disconnect a live ERP session (C0000006).
                                 accessibility_tick = accessibility_tick.wrapping_add(1);
                                 if matches_session && !needs_remount && accessibility_tick % 6 == 0 {
-                                    if !is_drive_accessible(letter).await {
+                                    let accessible = is_drive_accessible(letter).await;
+                                    if probe_tracker.record_probe(accessible) {
                                         needs_remount = true;
                                     }
                                 }
@@ -205,6 +341,7 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                                         *state.active_unc.lock().await = Some(desired_unc);
                                         *state.is_connected.lock().await = true;
                                         needs_remount = false;
+                                        probe_tracker.reset();
                                     }
                                 }
                             }
@@ -212,10 +349,12 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                     }
                     (_, ConnectionPhase::Reconnecting) => {
                         needs_remount = true;
+                        probe_tracker.reset();
                     }
                     (_, ConnectionPhase::Suspended) | (_, ConnectionPhase::Disconnected) => {
                         // Rule 5.3 Anti-Corruption: cleanly unmount user-session drive on Sleep or Disconnect
                         needs_remount = false;
+                        probe_tracker.reset();
                         if let Some((letter, _)) = mounted_unc_in_session.take() {
                             let _ = state.system.unmount_drive(letter).await;
                             *state.active_drive.lock().await = None;
@@ -344,4 +483,54 @@ pub fn set_tray_autostart_registry(enable: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_drive_probe_tracker_requires_three_consecutive_failures() {
+        let mut tracker = DriveProbeTracker::default();
+        // Transient slow probes during heavy Marg/Tally DBF I/O must NOT trigger remount
+        assert!(!tracker.record_probe(false));
+        assert!(!tracker.record_probe(false));
+        // One healthy probe resets the streak
+        assert!(!tracker.record_probe(true));
+        assert_eq!(tracker.consecutive_failures, 0);
+
+        // Only 3 consecutive failures trigger remount
+        assert!(!tracker.record_probe(false));
+        assert!(!tracker.record_probe(false));
+        assert!(tracker.record_probe(false));
+    }
+
+    #[test]
+    fn test_should_adopt_existing_mount_case_and_slash_insensitive() {
+        assert!(should_adopt_existing_mount(
+            Some('z'),
+            Some(r"\\10.99.0.1\F\"),
+            'Z',
+            r"\\10.99.0.1\F"
+        ));
+        assert!(should_adopt_existing_mount(
+            Some('Z'),
+            Some(r"\\10.99.0.1\margerp"),
+            'Z',
+            r"\\10.99.0.1\MARGERP"
+        ));
+        assert!(!should_adopt_existing_mount(
+            Some('Y'),
+            Some(r"\\10.99.0.1\F"),
+            'Z',
+            r"\\10.99.0.1\F"
+        ));
+        assert!(!should_adopt_existing_mount(
+            Some('Z'),
+            Some(r"\\10.99.0.1\MARGERP"),
+            'Z',
+            r"\\10.99.0.1\F"
+        ));
+        assert!(!should_adopt_existing_mount(None, None, 'Z', r"\\10.99.0.1\F"));
+    }
 }
